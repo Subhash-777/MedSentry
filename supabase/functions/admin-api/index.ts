@@ -48,7 +48,7 @@ serve(async (req) => {
 
     if (action === 'get_dashboard_data') {
       const [users, groups, usage, syncs, admin_audits, caregiver_audits] = await Promise.all([
-        supabaseAdmin.from('profiles').select('id, full_name, account_type, created_at'),
+        supabaseAdmin.from('profiles').select('id, full_name, is_admin, account_type, created_at'),
         supabaseAdmin.from('family_groups').select('id, name, owner_id, created_at'),
         supabaseAdmin.from('api_usage_logs').select('*').order('created_at', { ascending: false }).limit(100),
         supabaseAdmin.from('dataset_sync_log').select('*').order('last_refreshed_at', { ascending: false }).limit(20),
