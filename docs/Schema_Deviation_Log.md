@@ -248,3 +248,26 @@ Format per entry:
 - **Why §4 wasn't sufficient**: plan.md §4 didn't link `misuse_events` to `medication_courses`. This meant a course flipping between flagged and valid (via admin override or AI re-eval) would create multiple duplicate AMR misuse events for the same underlying course. Linking `course_id` and adding a unique constraint prevents statistical inflation by ensuring each course contributes AT MOST ONE event of a given type.
 - **Decision**: Approved by user 2026-07-19.
 - **Status**: Pending (Migration written, awaiting manual `supabase db push`)
+
+---
+
+## Deviation #12 — Temporary `auto_confirm_user` trigger (CREATED & REMOVED)
+
+- **Date**: 2026-08-23 (Created) / 2026-09-01 (Removed)
+- **Migration file**: `20260823000002_auto_confirm_users.sql` (Deleted)
+- **Change**:
+  ```sql
+  -- Temporary trigger that set NEW.email_confirmed_at = NOW() on auth.users BEFORE INSERT
+  DROP TRIGGER IF EXISTS on_auth_user_created_auto_confirm ON auth.users;
+  DROP FUNCTION IF EXISTS public.auto_confirm_user();
+  ```
+- **Why §4 wasn't sufficient / Root Cause**: Introduced as an unreviewed temporary shortcut on 2026-08-23 during testing when Supabase default SMTP mailer hit free-tier rate limits (3 confirmation emails/hour). It bypassed `auth.signUp()` email confirmation entirely, rendering the Supabase Dashboard "Confirm email" toggle irrelevant.
+- **Decision**: Audit Finding #1 (2026-09-01). Per explicit user directive, the trigger and function were completely REMOVED from the DB schema and codebase to enforce strict 100% production auth integrity.
+- **Status**: RESOLVED & REMOVED (Executed on Live Database 2026-09-01T18:25:39Z)
+- **Live Verification**:
+  - `pg_trigger`: 0 rows returned for `on_auth_user_created_auto_confirm` (Verified via `psql`)
+  - `pg_proc`: 0 rows returned for `auto_confirm_user()` (Verified via `psql`)
+  - `auth.signUp()`: Unconfirmed state verified (`email_confirmed_at: NULL`, `confirmation_sent_at` timestamped `2026-09-01T18:25:59Z`).
+  - **SMTP / Resend Domain Status**: Resend is currently using the **`onboarding@resend.dev` sandbox domain** (no custom domain verified). Under Resend sandbox rules, emails are **only delivered to the registered owner inbox (`subhashravichandran7432@gmail.com`)**; non-owner test recipients are blocked by Resend sandbox policy.
+- **Tracked Pre-Launch Follow-Up**: Before onboarding external multi-user public signups, a custom sending domain (e.g., `@medsentry.app`) must be added and verified via DNS in Resend to allow unconstrained confirmation email delivery to all recipient addresses.
+

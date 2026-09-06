@@ -47,26 +47,62 @@ serve(async (req) => {
     const { action, payload } = body
 
     if (action === 'get_dashboard_data') {
-      const [users, groups, usage, syncs, admin_audits, caregiver_audits] = await Promise.all([
-        supabaseAdmin.from('profiles').select('id, full_name, is_admin, account_type, created_at'),
+      const [profilesRes, authUsersRes, groups, usage, syncs, admin_audits, caregiver_audits] = await Promise.all([
+        supabaseAdmin.from('profiles').select('*'),
+        supabaseAdmin.auth.admin.listUsers(),
         supabaseAdmin.from('family_groups').select('id, name, owner_id, created_at'),
         supabaseAdmin.from('api_usage_logs').select('*').order('created_at', { ascending: false }).limit(100),
         supabaseAdmin.from('dataset_sync_log').select('*').order('last_refreshed_at', { ascending: false }).limit(20),
         supabaseAdmin.from('admin_audit_log').select('*').order('created_at', { ascending: false }).limit(100),
         supabaseAdmin.from('caregiver_audit_log').select('*').order('created_at', { ascending: false }).limit(100)
       ])
-      return new Response(JSON.stringify({ users: users.data, groups: groups.data, usage: usage.data, syncs: syncs.data, admin_audits: admin_audits.data, caregiver_audits: caregiver_audits.data }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+
+      const authUsersMap = new Map((authUsersRes.data?.users || []).map((u: any) => [u.id, u]))
+
+      const enrichedUsers = (profilesRes.data || []).map((p: any) => {
+        const authUser = authUsersMap.get(p.id)
+        return {
+          ...p,
+          email: authUser?.email || null,
+          is_banned: authUser?.banned_until ? new Date(authUser.banned_until) > new Date() : false,
+          banned_until: authUser?.banned_until || null,
+          confirmed_at: authUser?.email_confirmed_at || null,
+          last_sign_in_at: authUser?.last_sign_in_at || null,
+        }
+      })
+
+      return new Response(JSON.stringify({
+        users: enrichedUsers,
+        groups: groups.data,
+        usage: usage.data,
+        syncs: syncs.data,
+        admin_audits: admin_audits.data,
+        caregiver_audits: caregiver_audits.data
+      }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
     }
 
     // Server-side validation for destructive/corrective actions
-    if (['deactivate_user', 'update_profile', 'disband_circle'].includes(action)) {
+    if (['deactivate_user', 'activate_user', 'delete_user', 'update_profile', 'disband_circle'].includes(action)) {
       if (!payload?.reason || payload.reason.trim() === '') {
         return new Response(JSON.stringify({ error: 'A mandatory reason must be provided for this action.' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
       }
     }
 
+    if (action === 'get_user_details') {
+      const target_id = payload.target_user_id
+      const [coursesRes, familyRes, userAuditRes] = await Promise.all([
+        supabaseAdmin.from('medication_courses').select('id, custom_name, status, created_at').eq('user_id', target_id),
+        supabaseAdmin.from('family_members').select('group_id, role, is_linked_dependent, family_groups(name)').eq('member_id', target_id),
+        supabaseAdmin.from('admin_audit_log').select('*').eq('target_user_id', target_id).order('created_at', { ascending: false }).limit(20)
+      ])
+      return new Response(JSON.stringify({
+        courses: coursesRes.data || [],
+        family: familyRes.data || [],
+        audits: userAuditRes.data || []
+      }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+    }
+
     if (action === 'deactivate_user') {
-      // Banning a user requires supabaseAdmin.auth.admin.updateUserById, assuming we have admin access
       const { error: banError } = await supabaseAdmin.auth.admin.updateUserById(payload.target_user_id, { ban_duration: '876000h' })
       if (banError) throw banError
 
@@ -76,6 +112,45 @@ serve(async (req) => {
         action: 'deactivate_user',
         details: { reason: payload.reason }
       })
+      return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+    }
+
+    if (action === 'activate_user') {
+      const { error: unbanError } = await supabaseAdmin.auth.admin.updateUserById(payload.target_user_id, { ban_duration: 'none' })
+      if (unbanError) throw unbanError
+
+      await supabaseAdmin.from('admin_audit_log').insert({
+        admin_id: user.id,
+        target_user_id: payload.target_user_id,
+        action: 'activate_user',
+        details: { reason: payload.reason }
+      })
+      return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+    }
+
+    if (action === 'delete_user') {
+      const target_id = payload.target_user_id;
+
+      // 1. Log administrative audit entry prior to deletion
+      await supabaseAdmin.from('admin_audit_log').insert({
+        admin_id: user.id,
+        target_user_id: target_id,
+        action: 'delete_user',
+        details: { reason: payload.reason }
+      })
+
+      // 2. Delete user from Auth FIRST (GoTrue Admin API).
+      // If GoTrue fails or throws, execution stops immediately and NO profile/database data is deleted.
+      const { error: delError } = await supabaseAdmin.auth.admin.deleteUser(target_id)
+      if (delError) {
+        throw new Error(`Auth user deletion failed: ${delError.message || JSON.stringify(delError)}`)
+      }
+
+      // 3. Clean up any remaining database rows (Postgres ON DELETE CASCADE will also fire automatically)
+      await supabaseAdmin.from('medication_courses').delete().eq('user_id', target_id)
+      await supabaseAdmin.from('family_members').delete().eq('member_id', target_id)
+      await supabaseAdmin.from('profiles').delete().eq('id', target_id)
+
       return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
     }
 
