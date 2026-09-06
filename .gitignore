@@ -5,3 +5,4 @@ node_modules/
 .idea/
 *.tsbuildinfo
 .DS_Store
+docs/DEMO_CREDENTIALS.md

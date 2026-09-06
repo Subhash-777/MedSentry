@@ -474,8 +474,11 @@ serve(async (req) => {
       });
     }
 
-    const payload: RouterPayload = await req.json();
-    const { request_type, messages = [], image_base64, userContext = {} } = payload;
+    const payload = await req.json();
+    const request_type: RequestType = payload.request_type || payload.type || payload.action || "chatbot";
+    const messages = payload.messages || [];
+    const image_base64 = payload.image_base64;
+    const userContext = payload.userContext || {};
     const query = userContext.query ?? messages[messages.length - 1]?.content ?? "";
 
     // ── Build mode-specific system prompt & context ──────────────────────────
