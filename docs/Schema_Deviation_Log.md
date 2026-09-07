@@ -271,3 +271,20 @@ Format per entry:
   - **SMTP / Resend Domain Status**: Resend is currently using the **`onboarding@resend.dev` sandbox domain** (no custom domain verified). Under Resend sandbox rules, emails are **only delivered to the registered owner inbox (`subhashravichandran7432@gmail.com`)**; non-owner test recipients are blocked by Resend sandbox policy.
 - **Tracked Pre-Launch Follow-Up**: Before onboarding external multi-user public signups, a custom sending domain (e.g., `@medsentry.app`) must be added and verified via DNS in Resend to allow unconstrained confirmation email delivery to all recipient addresses.
 
+---
+
+## Deviation #13 — `duration_onset`, `category_location`, `image_url` on `symptom_journal`
+
+- **Date**: 2026-09-07 (Phase 6 Enhancement)
+- **Migration file**: `20260907184500_expand_symptom_journal.sql`
+- **Change**:
+  ```sql
+  ALTER TABLE public.symptom_journal
+    ADD COLUMN IF NOT EXISTS duration_onset text,
+    ADD COLUMN IF NOT EXISTS category_location text,
+    ADD COLUMN IF NOT EXISTS image_url text;
+  ```
+- **Why §4 wasn't sufficient**: plan.md §2.8 specifies rich symptom logging for side-effect correlation against active medication courses. The initial `symptom_journal` schema only had `symptom` and `severity`. Adding `duration_onset`, `category_location`, and `image_url` enables users to record when symptoms started, tag body systems (e.g. skin, stomach, headache), and attach photo evidence (e.g. rash or swelling) for AI analysis.
+- **Decision**: Approved by user 2026-09-07.
+- **Status**: Applied
+

@@ -161,39 +161,60 @@ async function logUsage(
 // ============================================================================
 
 function buildSuitabilityPrompt(query: string, context: any): string {
-  return `You are MedSentry's AI Health Consultant in SUITABILITY CHECK mode.
-The user wants to know if a medicine is suitable for them given their conditions and current medications.
+  let prompt = "";
+  if (context.allergyMatchWarning) {
+    prompt += `${context.allergyMatchWarning}\n\n`;
+  }
+  prompt += `You are MedSentry's AI Health Consultant in SUITABILITY CHECK mode.
+The user wants to know if a medicine is suitable for them given their conditions, allergies, and active medications.
 
-${context.activeMeds ? `Active medications: ${context.activeMeds}` : ""}
-${context.interactions ? `Known interactions with their medications: ${context.interactions}` : ""}
+${context.profile ? `User Profile:
+- Name: ${context.profile.full_name || "User"}
+- Age: ${context.profile.age ?? "Not specified"} | Weight: ${context.profile.weight_kg ? context.profile.weight_kg + " kg" : "Not specified"}
+- Known Conditions: ${context.profile.known_conditions?.join(", ") || "None recorded"}
+- Recorded Allergies: ${context.profile.allergies?.join(", ") || "None recorded"}` : ""}
+
+${context.activeMeds?.length > 0 ? `Active medications: ${context.activeMeds.join(", ")}` : "No active medications."}
+${context.interactions?.length > 0 ? `Known drug interactions: ${JSON.stringify(context.interactions)}` : ""}
 ${context.drugInfo ? `Drug reference data: ${JSON.stringify(context.drugInfo)}` : ""}
 
 Respond with:
-1. Whether the medicine appears suitable or has concerns (be specific)
-2. Any interaction warnings from their active medication list
-3. A clear recommendation to confirm with their doctor or pharmacist
+1. Direct suitability assessment (highlighting any allergy or pre-existing condition conflict)
+2. Any interaction warnings from active medications
+3. A clear recommendation to confirm with a doctor or pharmacist
 
 User query: ${query}`;
+  return prompt;
 }
 
 function buildSymptomToCarePrompt(query: string, context: any): string {
-  return `You are MedSentry's AI Health Consultant in SYMPTOM-TO-CARE mode.
-Analyze the user's symptoms and determine whether antibiotic or prescription medication is likely necessary.
+  let prompt = "";
+  if (context.allergyMatchWarning) {
+    prompt += `${context.allergyMatchWarning}\n\n`;
+  }
+  prompt += `You are MedSentry's AI Health Consultant in SYMPTOM-TO-CARE mode.
+Analyze the user's symptoms in the context of their profile and active medications.
 
-${context.activeMeds ? `User's active medications: ${context.activeMeds}` : ""}
-${context.symptoms ? `Recent symptom journal: ${context.symptoms}` : ""}
+${context.profile ? `User Profile:
+- Age: ${context.profile.age ?? "Not specified"}
+- Known Conditions: ${context.profile.known_conditions?.join(", ") || "None recorded"}
+- Recorded Allergies: ${context.profile.allergies?.join(", ") || "None recorded"}` : ""}
+
+${context.activeMeds?.length > 0 ? `User's active medications: ${context.activeMeds.join(", ")}` : ""}
+${context.symptoms?.length > 0 ? `Recent symptom journal: ${JSON.stringify(context.symptoms)}` : ""}
 
 Your response MUST include this structured block at the end, on its own line:
 NECESSITY_ASSESSMENT: <one of: necessary | not_necessary | unclear>
 
 Rules:
 - Mark "necessary" only if symptoms clearly indicate a condition that typically requires prescription treatment.
-- Mark "not_necessary" if symptoms are consistent with self-limiting illness (viral, minor injury, etc.).
+- Mark "not_necessary" if symptoms are consistent with self-limiting illness.
 - Mark "unclear" if you cannot determine without examination.
 - Always recommend professional evaluation regardless of assessment.
 - AWaRe context: ${context.awareClass ? `This drug class is AWaRe tier: ${context.awareClass}` : "No specific AWaRe context provided."}
 
 User query: ${query}`;
+  return prompt;
 }
 
 function buildVisualIdPrompt(query: string): string {
@@ -211,15 +232,26 @@ User query: ${query || "Please identify this medicine."}`;
 
 function buildChatbotSystemPrompt(context: any): string {
   let prompt = `You are MedSentry's AI Health Chatbot — a conversational, routine-aware health assistant.
-You have access to the user's medication and health context below. Use it to give personalized, relevant responses.
+You have access to the user's health profile, medication list, adherence history, and symptom journal below.
+Use this context to provide highly personalized, relevant responses.
 Never prescribe medications. Always recommend professional consultation for medical decisions.`;
+
+  if (context.profile) {
+    prompt += `\n\nUser Profile:
+- Name: ${context.profile.full_name || "User"}
+- Age: ${context.profile.age ?? "Not specified"} | Weight: ${context.profile.weight_kg ? context.profile.weight_kg + " kg" : "Not specified"}
+- Known Conditions: ${context.profile.known_conditions?.join(", ") || "None recorded"}
+- Recorded Allergies: ${context.profile.allergies?.join(", ") || "None recorded"}`;
+  }
+
+  if (context.adherenceSummary) {
+    prompt += `\n\nAdherence Summary: ${context.adherenceSummary}`;
+  }
 
   if (context.activeCourses?.length > 0) {
     prompt += `\n\nUser's active medication courses:\n${JSON.stringify(context.activeCourses, null, 2)}`;
   }
-  if (context.doseHistory?.length > 0) {
-    prompt += `\n\nRecent dose adherence (last 7 days):\n${JSON.stringify(context.doseHistory, null, 2)}`;
-  }
+
   if (context.symptomJournal?.length > 0) {
     prompt += `\n\nRecent symptom journal entries:\n${JSON.stringify(context.symptomJournal, null, 2)}`;
   } else {
@@ -238,6 +270,13 @@ async function buildChatbotContext(userClient: any, userId: string | undefined) 
 
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
+  // User profile demographics & medical history
+  const { data: profile } = await userClient
+    .from("profiles")
+    .select("full_name, age, weight_kg, height_cm, known_conditions, allergies, preferred_language")
+    .eq("id", userId)
+    .maybeSingle();
+
   // Active medication courses
   const { data: activeCourses } = await userClient
     .from("medication_courses")
@@ -254,16 +293,29 @@ async function buildChatbotContext(userClient: any, userId: string | undefined) 
     .order("taken_at", { ascending: false })
     .limit(50);
 
-  // Symptom journal — last 7 days (expected empty for now per plan.md §2.8 deferral)
+  const totalLogged = doseHistory?.length ?? 0;
+  const takenCount = doseHistory?.filter((d: any) => d.status === "taken").length ?? 0;
+  const adherenceRate = totalLogged > 0 ? Math.round((takenCount / totalLogged) * 100) : null;
+  const adherenceSummary = adherenceRate !== null
+    ? `${adherenceRate}% adherence (${takenCount}/${totalLogged} doses logged as taken in last 7 days)`
+    : "No recent dose log data in last 7 days";
+
+  // Symptom journal — last 7 days
   const { data: symptomJournal } = await userClient
     .from("symptom_journal")
-    .select("symptom, severity, status, created_at")
+    .select("symptom, severity, status, duration_onset, category_location, created_at")
     .eq("user_id", userId)
     .gte("created_at", sevenDaysAgo)
     .order("created_at", { ascending: false })
     .limit(20);
 
-  return { activeCourses: activeCourses ?? [], doseHistory: doseHistory ?? [], symptomJournal: symptomJournal ?? [] };
+  return {
+    profile: profile ?? null,
+    activeCourses: activeCourses ?? [],
+    doseHistory: doseHistory ?? [],
+    adherenceSummary,
+    symptomJournal: symptomJournal ?? [],
+  };
 }
 
 async function buildConsultantContext(userClient: any, userId: string | undefined, drugName: string | undefined) {
@@ -274,6 +326,17 @@ async function buildConsultantContext(userClient: any, userId: string | undefine
   let interactions: any[] = [];
   let activeMeds: string[] = [];
   let symptoms: any[] = [];
+  let profile: any = null;
+  let allergyMatchWarning: string | null = null;
+
+  if (userId) {
+    const { data: p } = await userClient
+      .from("profiles")
+      .select("full_name, age, weight_kg, height_cm, known_conditions, allergies")
+      .eq("id", userId)
+      .maybeSingle();
+    profile = p ?? null;
+  }
 
   // Look up the drug in our reference table for AWaRe class + info
   if (drugName) {
@@ -292,6 +355,18 @@ async function buildConsultantContext(userClient: any, userId: string | undefine
     } else if (drug) {
       awareClass = drug.aware_class;
       drugInfo = drug;
+
+      // Deterministic server-side allergy pre-check against user's recorded allergies
+      if (profile?.allergies && Array.isArray(profile.allergies) && profile.allergies.length > 0) {
+        const drugTargetText = `${drug.name || ""} ${drug.category || ""} ${drug.aware_class || ""}`.toLowerCase();
+        for (const allergy of profile.allergies) {
+          const allergyTerm = String(allergy).trim().toLowerCase();
+          if (allergyTerm.length >= 3 && drugTargetText.includes(allergyTerm)) {
+            allergyMatchWarning = `CRITICAL SAFETY WARNING: The user has a recorded allergy to '${allergy}'. The target drug '${drug.name}' matches this allergy category ('${drug.category || drug.name}'). YOU MUST LEAD YOUR RESPONSE WITH AN EXPLICIT, HIGH-PRIORITY ALLERGY WARNING IN BOLD BEFORE ANY OTHER ANALYSIS.`;
+            break;
+          }
+        }
+      }
 
       // Get the user's active drug IDs for interaction lookup
       if (userId) {
@@ -335,7 +410,7 @@ async function buildConsultantContext(userClient: any, userId: string | undefine
     symptoms = sj ?? [];
   }
 
-  return { awareClass, drugInfo, interactions, activeMeds, symptoms };
+  return { profile, awareClass, drugInfo, interactions, activeMeds, symptoms, allergyMatchWarning };
 }
 
 // ============================================================================
