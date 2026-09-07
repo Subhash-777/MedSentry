@@ -357,6 +357,10 @@ async function buildConsultantContext(userClient: any, userId: string | undefine
       drugInfo = drug;
 
       // Deterministic server-side allergy pre-check against user's recorded allergies
+      // NOTE / LIMITATION: Current implementation uses single-direction lexical substring matching.
+      // Phrases with qualifiers (e.g. "Penicillin allergy") or plurals ("Penicillins") will not match
+      // single terms in drugTargetText. Clinical cross-reactivity (e.g. penicillin-cephalosporin) is also omitted.
+      // FUTURE FOLLOW-UP: Implement bidirectional token matching (split on whitespace) and clinical drug-class mapping.
       if (profile?.allergies && Array.isArray(profile.allergies) && profile.allergies.length > 0) {
         const drugTargetText = `${drug.name || ""} ${drug.category || ""} ${drug.aware_class || ""}`.toLowerCase();
         for (const allergy of profile.allergies) {
