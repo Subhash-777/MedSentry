@@ -288,3 +288,46 @@ Format per entry:
 - **Decision**: Approved by user 2026-09-07.
 - **Status**: Applied
 
+---
+
+## Deviation #14 — `pg_trgm` Extension & `fuzzy_search_drug` RPC Function
+
+- **Date**: 2026-10-10 (OCR Resiliency Upgrade)
+- **Migration file**: `20261010000001_ocr_fuzzy_search_trgm.sql`
+- **Change**:
+  ```sql
+  CREATE EXTENSION IF NOT EXISTS pg_trgm;
+  CREATE INDEX IF NOT EXISTS idx_drugs_name_trgm ON public.drugs USING gin (name gin_trgm_ops);
+
+  CREATE OR REPLACE FUNCTION public.fuzzy_search_drug(search_terms text[])
+  RETURNS TABLE (
+    id uuid,
+    name text,
+    similarity_score real
+  )
+  LANGUAGE plpgsql
+  STABLE
+  SECURITY DEFINER
+  SET search_path = public
+  AS $$
+  BEGIN
+    RETURN QUERY
+    SELECT 
+      d.id, 
+      d.name, 
+      similarity(d.name, term) AS similarity_score
+    FROM public.drugs d
+    CROSS JOIN unnest(search_terms) AS term
+    WHERE similarity(d.name, term) >= 0.42
+    ORDER BY similarity_score DESC
+    LIMIT 1;
+  END;
+  $$;
+
+  GRANT EXECUTE ON FUNCTION public.fuzzy_search_drug(text[]) TO authenticated, anon;
+  ```
+- **Why §4 wasn't sufficient**: Substring `ilike` in `findDrugFromOcrText` fails when on-device OCR makes 1-character errors (e.g., `Paracetam0l` with a zero, or `Amoxlcillin` with an `l` instead of `i`). The `pg_trgm` extension and `fuzzy_search_drug` RPC enable trigram similarity matching directly inside PostgreSQL, matching OCR-scanned medicine strips against `public.drugs` with fault tolerance. Client-side Levenshtein fallback ensures the mobile app functions even before this migration runs.
+- **Decision**: Approved by user with explicit token `APPROVED: RUN MIGRATION` (2026-10-10).
+- **Status**: Applied (Executed via `supabase db push` on Live Database 2026-10-10; verified with `fuzzy_search_drug` live test returning Amoxicillin for 'Amoxlcillin' typo at 0.6 similarity score).
+
+

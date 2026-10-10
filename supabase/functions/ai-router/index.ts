@@ -34,7 +34,7 @@ const CORS = {
 // Types
 // ============================================================================
 
-type ConsultantMode = "suitability" | "symptom_to_care" | "visual_id";
+type ConsultantMode = "suitability" | "symptom_to_care" | "visual_id" | "prescription_ocr";
 type RequestType = ConsultantMode | "chatbot";
 type NecessityFlag = "necessary" | "not_necessary" | "unclear";
 
@@ -228,6 +228,43 @@ Identify:
 4. A reminder that visual identification is not a substitute for reading the actual label or consulting a pharmacist.
 
 User query: ${query || "Please identify this medicine."}`;
+}
+
+function buildPrescriptionOcrPrompt(): string {
+  return `You are MedSentry's clinical prescription extraction assistant.
+The user has uploaded an image of a medical prescription (which may be handwritten in cursive, typed, or a mixed doctor's script).
+Analyze the entire image and extract all patient, doctor, and prescription details.
+
+Strict Instructions:
+1. Accurately decipher doctors' cursive handwriting, clinical shorthand, and Latin abbreviations (e.g. Rx, OD, BD, BID, TID, QID, HS, SOS, PC, AC, STAT).
+2. Frequency normalization:
+   - "1-0-1" or "BD" / "BID" -> ["morning", "night"]
+   - "1-1-1" or "TID" -> ["morning", "afternoon", "night"]
+   - "1-0-0" or "OD" -> ["morning"]
+   - "0-0-1" or "HS" / "bedtime" -> ["night"]
+   - "SOS" / "as needed" -> ["as needed"]
+3. Format instructions cleanly (e.g. "After meals", "Before food", "With plenty of water").
+4. Return ONLY a single raw JSON object matching this exact schema:
+{
+  "patientName": "Extracted patient name or empty string",
+  "age": "Extracted age or empty string",
+  "weight": "Extracted weight or empty string",
+  "height": "Extracted height or empty string",
+  "conditions": ["Array of diagnosed conditions or symptoms"],
+  "doctorReg": "Doctor name or registration number or empty string",
+  "prescriptionDate": "YYYY-MM-DD or empty string",
+  "medicines": [
+    {
+      "name": "Medicine or drug name (brand or generic)",
+      "dosage": "Dosage with unit e.g. 500mg, 10ml, 1 tablet",
+      "frequency": ["morning", "night"],
+      "instructions": "e.g. After meals",
+      "durationDays": 7
+    }
+  ]
+}
+
+Do NOT wrap the response in markdown blocks like \`\`\`json. Return ONLY the raw valid JSON string.`;
 }
 
 function buildChatbotSystemPrompt(context: any): string {
@@ -577,6 +614,9 @@ serve(async (req) => {
         case "visual_id":
           systemPrompt = buildVisualIdPrompt(query);
           break;
+        case "prescription_ocr":
+          systemPrompt = buildPrescriptionOcrPrompt();
+          break;
         default:
           systemPrompt = buildSuitabilityPrompt(query, ctx);
       }
@@ -611,8 +651,19 @@ serve(async (req) => {
           }
         }
 
+        // Parse structured prescription JSON if in prescription_ocr mode
+        let parsed: any = null;
+        if (request_type === "prescription_ocr") {
+          try {
+            const raw = res.response.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+            parsed = JSON.parse(raw);
+          } catch (e) {
+            console.error("Prescription JSON parse error:", e);
+          }
+        }
+
         return new Response(
-          JSON.stringify({ text: safeText, provider: "gemini", flagged, guardTriggered, necessityFlag }),
+          JSON.stringify({ text: safeText, provider: "gemini", flagged, guardTriggered, necessityFlag, parsed }),
           { headers: { ...CORS, "Content-Type": "application/json" } }
         );
       } catch (err: any) {
