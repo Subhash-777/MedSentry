@@ -98,27 +98,27 @@ MedSentry is a state-of-the-art, mobile-first healthcare platform designed to co
 ### Frontend & Mobile Application
 * **Framework**: React Native with Expo SDK (EAS CLI & EAS Build)
 * **Language**: TypeScript (Strict Mode)
-* **Navigation**: React Navigation v6 (Native Stack + Material Top Tabs)
+* **Navigation**: React Navigation v7 (Native Stack + Material Top Tabs)
 * **Styling**: Organic & Balanced Design System (`mobile-app/src/theme/colors.ts`) with custom glassmorphism effects and WCAG AA accessible contrast tokens.
-* **Animations**: React Native Reanimated v3 (Smooth micro-animations & layout transitions)
+* **Animations**: React Native Reanimated v4 (Smooth micro-animations & layout transitions)
 * **Icons**: Custom vector icons powered by `lucide-react-native`
-* **On-Device OCR**: Google ML Kit (`react-native-mlkit-ocr`) with 2D spatial Y/X coordinate line clustering.
+* **On-Device OCR**: Google ML Kit (`react-native-mlkit-ocr`) with 2D spatial Y/X coordinate line clustering (documented as a known build dependency risk).
 * **Camera & Hardware Scanning**: `expo-camera` with live GS1 DataMatrix (2D), QR, and EAN-13 barcode parsing, and `expo-image-picker` for gallery uploads.
 
 ### Backend & Database Infrastructure
 * **Database**: Supabase Cloud PostgreSQL 15
 * **Fuzzy Search & Indexing**: PostgreSQL **`pg_trgm`** extension with GIN trigram indexing (`idx_drugs_name_trgm`) and `public.fuzzy_search_drug` RPC function.
-* **Security & RLS**: 100% Row Level Security (RLS) enforcement with `SECURITY DEFINER` PostgreSQL functions (`check_caregiver_access`, `check_circle_read_access`).
+* **Security & RLS**: 100% Row Level Security (RLS) enforcement with `SECURITY DEFINER` PostgreSQL functions (`check_caregiver_access`, `check_circle_read_access`, `is_admin()`).
 * **Database Triggers**: Automated badge unlock triggers (`trg_evaluate_badges`) and AMR misuse event tracking (`trg_track_misuse`).
 * **Serverless Edge Functions**: Deno / TypeScript Edge Functions:
-  * `ai-router`: Multi-model AI request handler with `prescription_ocr`, `suitability`, `symptom_to_care`, and `visual_id` modes, guardrail enforcement, and deterministic allergy pre-check.
-  * `admin-api`: Privileged service-role administrative portal operations.
-  * `verify-email`: Verification email dispatch via Resend API.
+  * `ai-router`: Multi-model AI request handler with JWT validation, per-user sliding-window rate limiting, input size limits, guardrails, and fallback chain.
+  * `admin-api`: Privileged service-role administrative portal operations with self-action protection and atomic database cleanup.
 
 ### AI APIs & LLM Providers
-* **Google Gemini API**: `gemini-flash-lite-latest` (Multimodal image analysis, doctor prescription handwriting extraction, and fast inference)
+* **Google Gemini API**: `gemini-flash-lite-latest` (Multimodal vision analysis, doctor prescription handwriting extraction, and fast inference)
 * **Groq API**: `llama-3.3-70b-versatile` (High-speed conversational chatbot)
-* **DeepSeek AI API**: Secondary model fallback
+* **OpenRouter API**: `mistralai/mixtral-8x22b-instruct` (High-accuracy clinical fallback)
+* **Hugging Face Inference API**: Clinical fallback model tier
 
 ---
 
@@ -135,7 +135,7 @@ graph TD
     E -->|Yes| F[Inject CRITICAL WARNING Head]
     E -->|No| G[Inject Profile Context]
     
-    F --> H[LLM Provider: Gemini / Groq / DeepSeek]
+    F --> H[LLM Provider Chain: Gemini / Groq / OpenRouter / HuggingFace]
     G --> H
     H -->|Structured Response / JSON| C
     C -->|Log API Metrics| B
@@ -234,17 +234,25 @@ The mobile application has been configured for building and uploading via **Expo
    ```
 
 3. **Environment Setup**:
-   Create a `mobile-app/.env` file:
+   Copy the client environment template in `mobile-app/`:
+   ```bash
+   cp mobile-app/.env.example mobile-app/.env
+   ```
+   Fill in your public client keys:
    ```env
    EXPO_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
    EXPO_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
-   GEMINI_API_KEY=your-gemini-key
-   GROQ_API_KEY=your-groq-key
+   EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID=your-google-client-id
    ```
 
-4. **Run Database Migrations (Supabase)**:
+4. **Set Edge Function Secrets (Supabase CLI)**:
+   AI provider keys are managed entirely server-side on Supabase Edge Functions:
    ```bash
-   npx supabase db push
+   npx supabase secrets set \
+     GEMINI_API_KEY="your-gemini-key" \
+     GROQ_API_KEY="your-groq-key" \
+     OPENROUTER_API_KEY="your-openrouter-key" \
+     HF_API_TOKEN="your-hf-token"
    ```
 
 5. **Deploy Supabase Edge Functions**:

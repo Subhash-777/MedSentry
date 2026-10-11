@@ -457,7 +457,7 @@ export default function MyMedicationsScreen() {
                   <TouchableOpacity style={styles.customFallbackCard} onPress={handleUseCustomFallback}>
                     <HelpCircle color={T.warningAmberSolid} size={20} style={{ marginRight: 10 }} />
                     <View style={{ flex: 1 }}>
-                      <Text style={styles.customFallbackTitle}>Can't find "{searchQuery}"?</Text>
+                      <Text style={styles.customFallbackTitle}>Can&apos;t find &ldquo;{searchQuery}&rdquo;?</Text>
                       <Text style={styles.customFallbackSub}>Tap to track as custom medication</Text>
                     </View>
                   </TouchableOpacity>
