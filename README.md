@@ -8,16 +8,30 @@ MedSentry is a state-of-the-art, mobile-first healthcare platform designed to co
 ## 🚀 Key Features & Modules
 
 ### 1. 📷 Smart OCR Prescription & Pill Strip Scanner
-* **Hybrid OCR Processing**: Scans prescription sheets and medicine packaging using camera capture or gallery upload.
-* **Intelligent Data Extraction**: Automatically extracts drug names, dosage amounts (e.g. `500mg`), daily frequencies, custom instructions, batch numbers, and expiry dates.
-* **Confidence Verification Screen**: Allows users to review and edit extracted prescription details prior to creating a tracked course.
+* **Hybrid 2-Tier OCR Engine**: Combines low-latency, on-device text recognition (**Google ML Kit**) with cloud-scale multimodal vision (**Google Gemini 1.5 Flash**) for maximum speed and accuracy.
+* **2D Spatial Layout Reconstruction**: Gathers bounding coordinates from ML Kit blocks and clusters lines sharing the same horizontal band ($\Delta y \le 65\%$ line height), sorting columns left-to-right. Preserves physical tabular rows so medication names, dosages, frequencies, and durations are never misaligned across table cells.
+* **Fuzzy Database Matching & Levenshtein Fallback**:
+  * Employs PostgreSQL's native **`pg_trgm`** trigram similarity extension and GIN indexing (`idx_drugs_name_trgm`) via the `fuzzy_search_drug` database function.
+  * Supplemented by client-side Levenshtein edit-distance calculations ($\ge 70\%$ similarity threshold) to effortlessly absorb OCR typographical errors (e.g. matching `Amoxlcillin` or `Paracetam0l` to their clean catalog counterparts).
+* **Multimodal AI Handwriting Reader**:
+  * An automated fallback and user-toggleable **"AI Doctor Handwriting Mode"** routes tricky or cursive prescriptions through the Supabase `ai-router` Edge Function to **Gemini 1.5 Flash Vision**.
+  * Formats clinical prescriptions into structured JSON schemas containing patient demographics, diagnosed conditions, doctor registration details, and medication courses.
+* **2D Barcode (GS1 DataMatrix & EAN-13) Auto-Scanner**:
+  * Live camera stream automatically detects pharmaceutical **GS1 DataMatrix** 2D codes and standard barcodes.
+  * Decodes Application Identifiers: `(01)` GTIN, `(17)` Expiry Date (`YYMMDD`), and `(10)` Batch Number, instantly warning users if a scanned medication has expired.
+* **Clinical Verification Screen**: Interactive confirmation screen (`VerifyPrescriptionScreen.tsx`) allowing users to review, edit, and confirm extracted medicine names, doses, frequencies, and instructions prior to adding courses to their adherence tracker.
 
 ### 2. 🌍 WHO AWaRe Antibiotic Classification System
 * **Stewardship Categorization**: Classifies every antibiotic into **Access**, **Watch**, **Reserve**, or **Not Recommended** tiers based on World Health Organization guidelines.
 * **Misuse Heatmap & Risk Scoring**: Automatically flags high-risk antibiotic usage ($K \ge 5$ threshold for unprescribed/overused Watch & Reserve tier drugs) to promote responsible prescribing.
 
 ### 3. 🤖 AI Health Consultant & Multi-Model Router (`ai-router`)
-* **Multi-Provider AI Routing**: Dynamically routes requests across **Google Gemini 1.5 Flash Lite**, **Groq Llama 3**, and **DeepSeek AI** via Supabase Edge Functions.
+* **Multi-Provider AI Routing**: Dynamically routes requests across **Google Gemini 1.5 Flash**, **Groq Llama 3**, and **DeepSeek AI** via Supabase Edge Functions.
+* **Clinical Request Modes**:
+  1. `suitability` — Cross-references candidate medicines against active courses, known conditions, and drug interactions.
+  2. `symptom_to_care` — Analyzes symptoms, correlates side effects, and outputs AWaRe necessity flags (`necessary`, `not_necessary`, `unclear`).
+  3. `visual_id` — Visual pill, blister strip, or packaging identification from captured images.
+  4. `prescription_ocr` — Clinical multimodal extraction of complex and cursive handwritten doctor prescriptions.
 * **Deterministic Server-Side Allergy Pre-Check**: Performs a pre-flight string/category match between the user's recorded allergies (`profiles.allergies`) and target drug data (`drugs.name`, `category`, `aware_class`), injecting a high-priority `CRITICAL SAFETY WARNING` before the LLM generates its response.
 * **Structured Medical Context Injection**: Injects user demographics (age, weight, height), known conditions, recorded allergies, 7-day adherence trends, and active medication courses into system prompts.
 * **3-Tier Clinical Guardrails**:
@@ -85,19 +99,21 @@ MedSentry is a state-of-the-art, mobile-first healthcare platform designed to co
 * **Styling**: Organic & Balanced Design System (`mobile-app/src/theme/colors.ts`) with custom glassmorphism effects and WCAG AA accessible contrast tokens.
 * **Animations**: React Native Reanimated v3 (Smooth micro-animations & layout transitions)
 * **Icons**: Custom vector icons powered by `lucide-react-native`
-* **Media & Camera**: `expo-image-picker` with native camera integration (`launchCameraAsync`)
+* **On-Device OCR**: Google ML Kit (`react-native-mlkit-ocr`) with 2D spatial Y/X coordinate line clustering.
+* **Camera & Hardware Scanning**: `expo-camera` with live GS1 DataMatrix (2D), QR, and EAN-13 barcode parsing, and `expo-image-picker` for gallery uploads.
 
 ### Backend & Database Infrastructure
 * **Database**: Supabase Cloud PostgreSQL 15
+* **Fuzzy Search & Indexing**: PostgreSQL **`pg_trgm`** extension with GIN trigram indexing (`idx_drugs_name_trgm`) and `public.fuzzy_search_drug` RPC function.
 * **Security & RLS**: 100% Row Level Security (RLS) enforcement with `SECURITY DEFINER` PostgreSQL functions (`check_caregiver_access`, `check_circle_read_access`).
 * **Database Triggers**: Automated badge unlock triggers (`trg_evaluate_badges`) and AMR misuse event tracking (`trg_track_misuse`).
 * **Serverless Edge Functions**: Deno / TypeScript Edge Functions:
-  * `ai-router`: Multi-model AI request handler, guardrail enforcement, and deterministic allergy pre-check.
+  * `ai-router`: Multi-model AI request handler with `prescription_ocr`, `suitability`, `symptom_to_care`, and `visual_id` modes, guardrail enforcement, and deterministic allergy pre-check.
   * `admin-api`: Privileged service-role administrative portal operations.
   * `verify-email`: Verification email dispatch via Resend API.
 
 ### AI APIs & LLM Providers
-* **Google Gemini API**: `gemini-flash-lite-latest` (Multimodal image analysis & fast inference)
+* **Google Gemini API**: `gemini-flash-lite-latest` (Multimodal image analysis, doctor prescription handwriting extraction, and fast inference)
 * **Groq API**: `llama-3.3-70b-versatile` (High-speed conversational chatbot)
 * **DeepSeek AI API**: Secondary model fallback
 
@@ -108,7 +124,7 @@ MedSentry is a state-of-the-art, mobile-first healthcare platform designed to co
 ```mermaid
 graph TD
     A[Mobile App - React Native / Expo] -->|JWT Auth & RLS Queries| B[Supabase Cloud PostgreSQL]
-    A -->|invokeAIRouter| C[Edge Function: ai-router]
+    A -->|invokeAIRouter: prescription_ocr| C[Edge Function: ai-router]
     A -->|invokeAdminApi| D[Edge Function: admin-api]
 
     C -->|Fetch Profile & Allergies| B
@@ -118,7 +134,7 @@ graph TD
     
     F --> H[LLM Provider: Gemini / Groq / DeepSeek]
     G --> H
-    H -->|Sanitized Response| C
+    H -->|Structured Response / JSON| C
     C -->|Log API Metrics| B
     C -->|Return Result| A
 
@@ -129,13 +145,14 @@ graph TD
 
 ## 🗄️ Database Schema Summary
 
-| Table | Description |
+| Table / Object | Description |
 | :--- | :--- |
 | `profiles` | User demographics (`age`, `weight_kg`, `height_cm`), `known_conditions`, `allergies`, `caregiver_consent_revoked`, `region`, and `is_admin`. |
 | `medication_courses` | Tracked prescriptions (`drug_id`, `custom_name`, `dosage_amount`, `frequency`, `instructions`, `total_pills`, `daily_dose`, `days_remaining`, `necessity_flag`, `expiry_date`, `batch_number`). |
 | `dose_logs` | Adherence logging (`course_id`, `taken_at`, `status`). |
 | `symptom_journal` | Symptom entries (`symptom`, `severity`, `status`, `linked_course_id`, `category_location`, `duration_onset`, `image_url`). |
-| `drugs` | Catalog reference table (752 rows) containing `name`, `category`, `aware_class`, `common_uses`, `side_effects`. |
+| `drugs` | Catalog reference table (752 rows) containing `name`, `category`, `aware_class`, `common_uses`, `side_effects`. Indexed with GIN Trigram (`idx_drugs_name_trgm`). |
+| `fuzzy_search_drug(text[])` | Stored RPC function for fault-tolerant fuzzy OCR candidate matching. |
 | `drug_interactions` | Pairwise interaction data (`drug_a_id`, `drug_b_id`, `severity`, `description`). |
 | `family_groups` | Family circles with unique 6-character `invite_code` and `owner_id`. |
 | `family_members` | Circle membership mapping (`group_id`, `member_id`, `role`, `is_linked_dependent`). |

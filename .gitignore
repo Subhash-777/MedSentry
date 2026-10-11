@@ -6,3 +6,5 @@ node_modules/
 *.tsbuildinfo
 .DS_Store
 docs/DEMO_CREDENTIALS.md
+__pycache__/
+*.pyc
