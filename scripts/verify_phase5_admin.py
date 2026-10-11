@@ -1,9 +1,11 @@
 import psycopg2, os, requests, json, time, uuid
 from dotenv import load_dotenv
 
-# Load DB URL (for direct Postgres data setup/teardown)
-load_dotenv('/home/subhash/projects/MedSentry/scripts/.env')
-db_url = os.environ['SUPABASE_DB_URL']
+load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+db_url = os.environ.get('SUPABASE_DB_URL')
+if not db_url:
+    print("Error: SUPABASE_DB_URL is missing. Set it in scripts/.env")
+    exit(1)
 
 # Load API URL and Anon Key (for authenticating against production)
 load_dotenv('/home/subhash/projects/MedSentry/mobile-app/.env')

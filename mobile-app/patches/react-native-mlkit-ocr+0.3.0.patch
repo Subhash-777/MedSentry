@@ -1,0 +1,76 @@
+diff --git a/node_modules/react-native-mlkit-ocr/android/build.gradle b/node_modules/react-native-mlkit-ocr/android/build.gradle
+index c2bcb60..e6af86a 100644
+--- a/node_modules/react-native-mlkit-ocr/android/build.gradle
++++ b/node_modules/react-native-mlkit-ocr/android/build.gradle
+@@ -1,18 +1,5 @@
+-buildscript {
+-  // Buildscript is evaluated before everything else so we can't use getExtOrDefault
+-  def kotlin_version = rootProject.ext.has('kotlinVersion') ? rootProject.ext.get('kotlinVersion') : project.properties['MlkitOcr_kotlinVersion']
+-
+-  repositories {
+-    google()
+-    jcenter()
+-  }
+-
+-  dependencies {
+-    classpath 'com.android.tools.build:gradle:3.2.1'
+-    // noinspection DifferentKotlinGradleVersion
+-    classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+-  }
+-}
++// buildscript block intentionally removed — root project provides AGP + Kotlin classpath.
++// jcenter() removed (shut down 2022, unsupported in Gradle 9).
+ 
+ apply plugin: 'com.android.library'
+ apply plugin: 'kotlin-android'
+@@ -29,11 +16,10 @@ android {
+   compileSdkVersion getExtOrIntegerDefault('compileSdkVersion')
+   buildToolsVersion getExtOrDefault('buildToolsVersion')
+   defaultConfig {
+-    minSdkVersion 16
++    minSdkVersion 24
+     targetSdkVersion getExtOrIntegerDefault('targetSdkVersion')
+     versionCode 1
+     versionName "1.0"
+-
+   }
+ 
+   buildTypes {
+@@ -52,7 +38,6 @@ android {
+ 
+ repositories {
+   mavenCentral()
+-  jcenter()
+   google()
+ 
+   def found = false
+@@ -73,7 +58,6 @@ repositories {
+       url defaultDir.toString()
+       name androidSourcesName
+     }
+-
+     logger.info(":${project.name}:reactNativeAndroidRoot ${defaultDir.canonicalPath}")
+     found = true
+   } else {
+@@ -98,7 +82,6 @@ repositories {
+           url androidPrebuiltBinaryDir.toString()
+           name androidSourcesName
+         }
+-
+         logger.info(":${project.name}:reactNativeAndroidRoot ${androidPrebuiltBinaryDir.canonicalPath}")
+         found = true
+       } else if (androidSourcesDir.exists()) {
+@@ -106,7 +89,6 @@ repositories {
+           url androidSourcesDir.toString()
+           name androidSourcesName
+         }
+-
+         logger.info(":${project.name}:reactNativeAndroidRoot ${androidSourcesDir.canonicalPath}")
+         found = true
+       }
+@@ -128,5 +110,4 @@ dependencies {
+   api 'com.facebook.react:react-native:+'
+   implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
+   implementation 'com.google.android.gms:play-services-mlkit-text-recognition:18.0.2'
+-
+ }

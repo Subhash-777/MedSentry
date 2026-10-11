@@ -2,24 +2,23 @@
  * ai-router — MedSentry Phase 3 Edge Function
  *
  * Auth pattern (per plan.md §3.2 + user review):
- *   - ANON key client  → used ONLY to verify the caller's JWT via auth.getUser(jwt).
- *     SUPABASE_ANON_KEY is auto-injected into every Edge Function by Supabase; no secret setup needed.
- *   - SERVICE ROLE client → used ONLY for privileged DB writes (api_usage_logs has no RLS policy
- *     yet; service role ensures writes always land regardless of future policy changes).
- *     SUPABASE_SERVICE_ROLE_KEY is also auto-injected; no secret setup needed.
- *   - Mobile client attaches the user's session JWT automatically via supabase.functions.invoke().
- *   - All AI provider keys (GEMINI_API_KEY, GROQ_API_KEY, …) live as Supabase secrets; the
- *     mobile client never holds them.
+ *   - Mandatory JWT verification: Every request MUST supply a valid user JWT in Authorization header.
+ *     Verified via auth.getUser(token). Missing or invalid tokens return HTTP 401 immediately.
+ *   - ANON key client  → used to verify the caller's JWT and perform RLS-scoped user DB reads.
+ *   - SERVICE ROLE client → used ONLY for privileged DB writes and rate limit queries (api_usage_logs).
+ *   - All AI provider keys live securely in Supabase secrets; never exposed to the client.
  *
  * Consultant modes (plan.md §2.5):
  *   1. suitability       — medicine-suitability check against user's active courses + conditions
  *   2. symptom_to_care   — symptom analysis with AWaRe-aware necessity flag output
  *   3. visual_id         — visual medicine identification from image
+ *   4. prescription_ocr  — clinical prescription entity extraction from image
  *
  * Guardrails (plan.md §2.5 / §3.3) — three distinct, independently tested checks:
  *   Guard 1: Pediatric dosage calculation refusal
  *   Guard 2: Overdose question refusal (standalone — not conflated with Guard 3)
  *   Guard 3: Severe self-diagnosis refusal (cancer, heart attack, stroke)
+ *   Applied across ALL modes (including prescription_ocr).
  */
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
@@ -29,6 +28,28 @@ const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
+
+// ============================================================================
+// Model & Rate Limit Constants
+// ============================================================================
+
+export const AI_MODELS = {
+  GEMINI: "gemini-flash-lite-latest",
+  GROQ: "llama-3.3-70b-versatile",
+  // Note: mistralai/mixtral-8x7b-instruct was decommissioned on OpenRouter;
+  // updated to current active equivalent mistralai/mixtral-8x22b-instruct.
+  OPENROUTER: "mistralai/mixtral-8x22b-instruct",
+} as const;
+
+export const RATE_LIMITS = {
+  PER_MINUTE: 10,
+  PER_DAY: 100,
+} as const;
+
+export const PAYLOAD_LIMITS = {
+  MAX_IMAGE_DECODED_BYTES: 4 * 1024 * 1024, // 4 MB decoded
+  ALLOWED_IMAGE_MIMES: ["image/jpeg", "image/png", "image/webp"],
+} as const;
 
 // ============================================================================
 // Types
@@ -44,7 +65,9 @@ interface AIMessage {
 }
 
 interface RouterPayload {
-  request_type: RequestType;
+  request_type?: RequestType;
+  type?: RequestType;
+  action?: RequestType;
   messages?: AIMessage[];
   image_base64?: string;
   userContext?: {
@@ -106,13 +129,11 @@ function guardSelfDiagnosis(text: string): string | null {
 
 // ============================================================================
 // Apply all three guardrails in order
-// Returns { safeText, flagged, guardTriggered }
 // ============================================================================
 function applyGuardrails(
   userInput: string,
   aiResponse: string
 ): { safeText: string; flagged: boolean; guardTriggered: string | null } {
-  // Apply guards against the user's original input (catches intent before the AI response)
   const combinedCheck = userInput + " " + aiResponse;
 
   const g1 = guardPediatricDosage(combinedCheck);
@@ -128,7 +149,7 @@ function applyGuardrails(
 }
 
 // ============================================================================
-// Logging (uses SERVICE ROLE client — api_usage_logs has no RLS yet)
+// Logging (uses SERVICE ROLE client — sanitized logs with error codes only)
 // ============================================================================
 async function logUsage(
   adminClient: any,
@@ -149,15 +170,86 @@ async function logUsage(
       outcome,
     });
     if (error) {
-      throw new Error("logUsage insert error: " + JSON.stringify(error));
+      console.error("Usage log error code: LOG_INSERT_ERR");
     }
-  } catch (err) {
-    throw err;
+  } catch (_err) {
+    console.error("Usage log exception code: LOG_INSERT_EXC");
   }
 }
 
 // ============================================================================
-// Prompt builders — one per Consultant mode + Chatbot
+// Image Payload Validator & MIME Extractor
+// ============================================================================
+function validateAndExtractImage(input: string): {
+  valid: boolean;
+  cleanBase64?: string;
+  mime?: string;
+  error?: string;
+  code?: string;
+  status?: number;
+} {
+  let mime: string | null = null;
+  let cleanBase64 = input.trim();
+
+  // Extract from data URI if present
+  const match = cleanBase64.match(/^data:([^;]+);base64,(.+)$/s);
+  if (match) {
+    mime = match[1].toLowerCase();
+    cleanBase64 = match[2].trim();
+  }
+
+  // Calculate decoded byte length: base64 characters encode 6 bits each
+  const padding = cleanBase64.endsWith("==") ? 2 : cleanBase64.endsWith("=") ? 1 : 0;
+  const decodedBytes = Math.floor((cleanBase64.length * 3) / 4) - padding;
+
+  if (decodedBytes > PAYLOAD_LIMITS.MAX_IMAGE_DECODED_BYTES) {
+    return {
+      valid: false,
+      error: `Payload too large: Decoded image size is ${(decodedBytes / (1024 * 1024)).toFixed(2)} MB, exceeding the 4 MB limit.`,
+      code: "PAYLOAD_TOO_LARGE",
+      status: 413,
+    };
+  }
+
+  // Infer MIME from signature if not in data URI
+  if (!mime) {
+    if (cleanBase64.startsWith("/9j/")) {
+      mime = "image/jpeg";
+    } else if (cleanBase64.startsWith("iVBORw0KGgo")) {
+      mime = "image/png";
+    } else if (cleanBase64.startsWith("UklGR")) {
+      mime = "image/webp";
+    } else {
+      try {
+        const bin = atob(cleanBase64.slice(0, 32));
+        const b = [bin.charCodeAt(0), bin.charCodeAt(1), bin.charCodeAt(2), bin.charCodeAt(3)];
+        if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) {
+          mime = "image/jpeg";
+        } else if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) {
+          mime = "image/png";
+        } else if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46) {
+          mime = "image/webp";
+        }
+      } catch (_e) {
+        // Base64 header decode failed
+      }
+    }
+  }
+
+  if (!mime || !PAYLOAD_LIMITS.ALLOWED_IMAGE_MIMES.includes(mime)) {
+    return {
+      valid: false,
+      error: `Unsupported image format. Allowed formats: ${PAYLOAD_LIMITS.ALLOWED_IMAGE_MIMES.join(", ")}. Received: ${mime || "unknown"}`,
+      code: "UNSUPPORTED_MEDIA_TYPE",
+      status: 415,
+    };
+  }
+
+  return { valid: true, cleanBase64, mime };
+}
+
+// ============================================================================
+// Prompt builders
 // ============================================================================
 
 function buildSuitabilityPrompt(query: string, context: any): string {
@@ -299,12 +391,10 @@ Never prescribe medications. Always recommend professional consultation for medi
 }
 
 // ============================================================================
-// Context builders — query DB using the user's anon client (respects RLS)
+// Context builders (query DB using user's RLS-scoped client)
 // ============================================================================
 
-async function buildChatbotContext(userClient: any, userId: string | undefined) {
-  if (!userId) return {};
-
+async function buildChatbotContext(userClient: any, userId: string) {
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
   // User profile demographics & medical history
@@ -333,9 +423,10 @@ async function buildChatbotContext(userClient: any, userId: string | undefined) 
   const totalLogged = doseHistory?.length ?? 0;
   const takenCount = doseHistory?.filter((d: any) => d.status === "taken").length ?? 0;
   const adherenceRate = totalLogged > 0 ? Math.round((takenCount / totalLogged) * 100) : null;
-  const adherenceSummary = adherenceRate !== null
-    ? `${adherenceRate}% adherence (${takenCount}/${totalLogged} doses logged as taken in last 7 days)`
-    : "No recent dose log data in last 7 days";
+  const adherenceSummary =
+    adherenceRate !== null
+      ? `${adherenceRate}% adherence (${takenCount}/${totalLogged} doses logged as taken in last 7 days)`
+      : "No recent dose log data in last 7 days";
 
   // Symptom journal — last 7 days
   const { data: symptomJournal } = await userClient
@@ -355,9 +446,7 @@ async function buildChatbotContext(userClient: any, userId: string | undefined) 
   };
 }
 
-async function buildConsultantContext(userClient: any, userId: string | undefined, drugName: string | undefined) {
-  if (!userId && !drugName) return {};
-
+async function buildConsultantContext(userClient: any, userId: string, drugName: string | undefined) {
   let awareClass: string | null = null;
   let drugInfo: any = null;
   let interactions: any[] = [];
@@ -366,14 +455,12 @@ async function buildConsultantContext(userClient: any, userId: string | undefine
   let profile: any = null;
   let allergyMatchWarning: string | null = null;
 
-  if (userId) {
-    const { data: p } = await userClient
-      .from("profiles")
-      .select("full_name, age, weight_kg, height_cm, known_conditions, allergies")
-      .eq("id", userId)
-      .maybeSingle();
-    profile = p ?? null;
-  }
+  const { data: p } = await userClient
+    .from("profiles")
+    .select("full_name, age, weight_kg, height_cm, known_conditions, allergies")
+    .eq("id", userId)
+    .maybeSingle();
+  profile = p ?? null;
 
   // Look up the drug in our reference table for AWaRe class + info
   if (drugName) {
@@ -384,20 +471,15 @@ async function buildConsultantContext(userClient: any, userId: string | undefine
       .limit(1)
       .maybeSingle();
 
-    if (error) console.error("Drug fetch error:", error);
-    if (!drug) console.error("Drug not found for:", drugName);
-
     if (error) {
-       awareClass = `ERROR FETCHING DRUG: ${JSON.stringify(error)}`;
-    } else if (drug) {
+      console.error("Drug fetch error code: DRUG_FETCH_ERR");
+    }
+
+    if (drug) {
       awareClass = drug.aware_class;
       drugInfo = drug;
 
       // Deterministic server-side allergy pre-check against user's recorded allergies
-      // NOTE / LIMITATION: Current implementation uses single-direction lexical substring matching.
-      // Phrases with qualifiers (e.g. "Penicillin allergy") or plurals ("Penicillins") will not match
-      // single terms in drugTargetText. Clinical cross-reactivity (e.g. penicillin-cephalosporin) is also omitted.
-      // FUTURE FOLLOW-UP: Implement bidirectional token matching (split on whitespace) and clinical drug-class mapping.
       if (profile?.allergies && Array.isArray(profile.allergies) && profile.allergies.length > 0) {
         const drugTargetText = `${drug.name || ""} ${drug.category || ""} ${drug.aware_class || ""}`.toLowerCase();
         for (const allergy of profile.allergies) {
@@ -409,47 +491,43 @@ async function buildConsultantContext(userClient: any, userId: string | undefine
         }
       }
 
-      // Get the user's active drug IDs for interaction lookup
-      if (userId) {
-        const { data: courses } = await userClient
-          .from("medication_courses")
-          .select("drug_id, custom_name")
-          .eq("user_id", userId)
-          .eq("status", "active")
-          .not("drug_id", "is", null);
+      // Look up active medication courses for interactions
+      const { data: courses } = await userClient
+        .from("medication_courses")
+        .select("drug_id, custom_name")
+        .eq("user_id", userId)
+        .eq("status", "active")
+        .not("drug_id", "is", null);
 
-        const activeIds = (courses ?? []).map((c: any) => c.drug_id).filter(Boolean);
-        activeMeds = (courses ?? []).map((c: any) => c.custom_name || "Unknown");
+      const activeIds = (courses ?? []).map((c: any) => c.drug_id).filter(Boolean);
+      activeMeds = (courses ?? []).map((c: any) => c.custom_name || "Unknown");
 
-        if (activeIds.length > 0) {
-          const { data: interA } = await userClient
-            .from("drug_interactions")
-            .select("severity, description, severity_source")
-            .eq("drug_a_id", drug.id)
-            .in("drug_b_id", activeIds);
+      if (activeIds.length > 0) {
+        const { data: interA } = await userClient
+          .from("drug_interactions")
+          .select("severity, description, severity_source")
+          .eq("drug_a_id", drug.id)
+          .in("drug_b_id", activeIds);
 
-          const { data: interB } = await userClient
-            .from("drug_interactions")
-            .select("severity, description, severity_source")
-            .eq("drug_b_id", drug.id)
-            .in("drug_a_id", activeIds);
+        const { data: interB } = await userClient
+          .from("drug_interactions")
+          .select("severity, description, severity_source")
+          .eq("drug_b_id", drug.id)
+          .in("drug_a_id", activeIds);
 
-          interactions = [...(interA ?? []), ...(interB ?? [])];
-        }
+        interactions = [...(interA ?? []), ...(interB ?? [])];
       }
     }
   }
 
   // Symptom journal context for symptom_to_care mode
-  if (userId) {
-    const { data: sj } = await userClient
-      .from("symptom_journal")
-      .select("symptom, severity, created_at")
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false })
-      .limit(10);
-    symptoms = sj ?? [];
-  }
+  const { data: sj } = await userClient
+    .from("symptom_journal")
+    .select("symptom, severity, created_at")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(10);
+  symptoms = sj ?? [];
 
   return { profile, awareClass, drugInfo, interactions, activeMeds, symptoms, allergyMatchWarning };
 }
@@ -469,19 +547,17 @@ function parseNecessityFlag(responseText: string): NecessityFlag | null {
 
 async function callGemini(
   key: string,
-  mode: RequestType,
   messages: AIMessage[],
   imageBase64: string | undefined,
-  systemPrompt: string,
-  query: string
+  imageMime: string,
+  systemPrompt: string
 ) {
   const startTime = Date.now();
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=${key}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${AI_MODELS.GEMINI}:generateContent?key=${key}`;
 
   const contents: any[] = [];
 
   if (messages && messages.length > 0) {
-    // Chatbot multi-turn: prepend system prompt as first user message
     contents.push({ role: "user", parts: [{ text: systemPrompt }] });
     contents.push({ role: "model", parts: [{ text: "Understood. I'm ready to help." }] });
     for (const msg of messages) {
@@ -491,10 +567,9 @@ async function callGemini(
       });
     }
   } else {
-    // Consultant single-turn
     const parts: any[] = [{ text: systemPrompt }];
     if (imageBase64) {
-      parts.push({ inline_data: { mime_type: "image/jpeg", data: imageBase64 } });
+      parts.push({ inline_data: { mime_type: imageMime, data: imageBase64 } });
     }
     contents.push({ role: "user", parts });
   }
@@ -555,49 +630,110 @@ async function callOpenAICompatible(
 // ============================================================================
 // Main handler
 // ============================================================================
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
-
-  const geminiKey = Deno.env.get("GEMINI_API_KEY") || "";
-  const groqKey = Deno.env.get("GROQ_API_KEY") || "";
-  const openRouterKey = Deno.env.get("OPENROUTER_API_KEY") || "";
-  const hfKey = Deno.env.get("HUGGINGFACE_API_KEY") || "";
 
   const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
   const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
   const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 
-  // ANON client — identity verification only
+  // ANON client for identity verification only
   const anonClient = createClient(SUPABASE_URL, ANON_KEY);
-  // SERVICE ROLE client — privileged writes only (api_usage_logs)
-  // SERVICE ROLE client — privileged writes only (api_usage_logs).
-  // Confirmed via diagnostics that SUPABASE_SERVICE_ROLE_KEY is correctly injected by the runtime,
-  // bypassing RLS.
+  // SERVICE ROLE client for logging and rate limit queries
   const adminClient = createClient(SUPABASE_URL, SERVICE_KEY);
 
+  // 1. Mandatory JWT Authentication Gate
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return new Response(
+      JSON.stringify({ error: "Missing or invalid Authorization header. A valid user JWT is required.", code: "AUTH_REQUIRED" }),
+      { headers: { ...CORS, "Content-Type": "application/json" }, status: 401 }
+    );
+  }
+
+  const token = authHeader.replace(/^Bearer\s+/i, "");
+  const { data: authData, error: authError } = await anonClient.auth.getUser(token);
+  if (authError || !authData?.user?.id) {
+    return new Response(
+      JSON.stringify({ error: "Unauthorized: Invalid or expired session token.", code: "AUTH_INVALID" }),
+      { headers: { ...CORS, "Content-Type": "application/json" }, status: 401 }
+    );
+  }
+
+  const userId = authData.user.id;
+  const userClient = createClient(SUPABASE_URL, ANON_KEY, {
+    global: { headers: { Authorization: authHeader } },
+  });
+
   try {
-    // ── Identify caller ──────────────────────────────────────────────────────
-    let userId: string | undefined;
-    let userClient = anonClient; // default: unauthed reads
-    const authHeader = req.headers.get("Authorization");
-    if (authHeader) {
-      const token = authHeader.replace("Bearer ", "");
-      const { data } = await anonClient.auth.getUser(token);
-      userId = data?.user?.id;
-      // Authenticated user client — DB reads respect RLS for this user
-      userClient = createClient(SUPABASE_URL, ANON_KEY, {
-        global: { headers: { Authorization: authHeader } },
-      });
+    // 2. Per-User Rate Limiting (10 req/min, 100 req/day)
+    const oneMinuteAgo = new Date(Date.now() - 60 * 1000).toISOString();
+    const { count: minCount, error: minErr } = await adminClient
+      .from("api_usage_logs")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .gte("created_at", oneMinuteAgo);
+
+    if (!minErr && (minCount ?? 0) >= RATE_LIMITS.PER_MINUTE) {
+      return new Response(
+        JSON.stringify({
+          error: `Rate limit exceeded: You have exceeded the limit of ${RATE_LIMITS.PER_MINUTE} requests per minute. Please try again shortly.`,
+          code: "RATE_LIMIT_PER_MINUTE"
+        }),
+        { headers: { ...CORS, "Content-Type": "application/json" }, status: 429 }
+      );
     }
 
-    const payload = await req.json();
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const { count: dayCount, error: dayErr } = await adminClient
+      .from("api_usage_logs")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .gte("created_at", oneDayAgo);
+
+    if (!dayErr && (dayCount ?? 0) >= RATE_LIMITS.PER_DAY) {
+      return new Response(
+        JSON.stringify({
+          error: `Daily limit exceeded: You have reached the maximum quota of ${RATE_LIMITS.PER_DAY} requests per day.`,
+          code: "RATE_LIMIT_PER_DAY"
+        }),
+        { headers: { ...CORS, "Content-Type": "application/json" }, status: 429 }
+      );
+    }
+
+    // 3. Parse JSON Body
+    let payload: RouterPayload;
+    try {
+      payload = await req.json();
+    } catch (_e) {
+      return new Response(
+        JSON.stringify({ error: "Invalid JSON request payload.", code: "BAD_REQUEST" }),
+        { headers: { ...CORS, "Content-Type": "application/json" }, status: 400 }
+      );
+    }
+
     const request_type: RequestType = payload.request_type || payload.type || payload.action || "chatbot";
     const messages = payload.messages || [];
-    const image_base64 = payload.image_base64;
+    let image_base64 = payload.image_base64;
+    let imageMime = "image/jpeg";
     const userContext = payload.userContext || {};
     const query = userContext.query ?? messages[messages.length - 1]?.content ?? "";
 
-    // ── Build mode-specific system prompt & context ──────────────────────────
+    // 4. Payload & Image Validation (4 MB decoded max, MIME whitelist)
+    if (image_base64) {
+      const validation = validateAndExtractImage(image_base64);
+      if (!validation.valid) {
+        return new Response(
+          JSON.stringify({ error: validation.error, code: validation.code }),
+          { headers: { ...CORS, "Content-Type": "application/json" }, status: validation.status }
+        );
+      }
+      image_base64 = validation.cleanBase64;
+      imageMime = validation.mime!;
+    }
+
+    // 5. Build mode-specific system prompt & context
     let systemPrompt: string;
     if (request_type === "chatbot") {
       const ctx = await buildChatbotContext(userClient, userId);
@@ -622,43 +758,48 @@ serve(async (req) => {
       }
     }
 
-    // ── Tier 1: On-device (graceful skip — see plan.md §3.3 / TODO: LiteRT) ─
+    // ── Tier 1: On-device (architectural skip / LiteRT stub) ────────────────
     await logUsage(adminClient, userId, "ondevice", request_type, 0, 0, "skipped");
 
     // ── Tier 2: Gemini ───────────────────────────────────────────────────────
     const geminiKey = Deno.env.get("GEMINI_API_KEY");
     if (geminiKey) {
       try {
-        const res = await callGemini(geminiKey, request_type, messages, image_base64, systemPrompt, query);
+        const res = await callGemini(geminiKey, messages, image_base64, imageMime, systemPrompt);
         await logUsage(adminClient, userId, "gemini", request_type, res.tokens, res.latency, "success");
+
+        // Universal guardrails enforcement across all modes (including prescription_ocr)
         const { safeText, flagged, guardTriggered } = applyGuardrails(query, res.response);
-        if (flagged) await logUsage(adminClient, userId, "guardrail", request_type, 0, 0, guardTriggered ?? "flagged");
+        if (flagged) {
+          await logUsage(adminClient, userId, "guardrail", request_type, 0, 0, guardTriggered ?? "flagged");
+        }
 
         // Necessity flag write-back for symptom_to_care
         let necessityFlag: NecessityFlag | null = null;
-        if (request_type === "symptom_to_care" && userContext.linked_course_id && userId) {
+        if (request_type === "symptom_to_care" && userContext.linked_course_id && !flagged) {
           necessityFlag = parseNecessityFlag(res.response);
           if (necessityFlag) {
-            console.error(`Updating DB for ${userContext.linked_course_id} user ${userId} to ${necessityFlag}`);
-            const { error: updErr, data } = await adminClient
+            const { error: updErr } = await adminClient
               .from("medication_courses")
               .update({ necessity_flag: necessityFlag })
               .eq("id", userContext.linked_course_id)
-              .eq("user_id", userId)
-              .select();
-            if (updErr) console.error("Update error:", updErr);
-            else console.error("Update success:", data);
+              .eq("user_id", userId);
+            if (updErr) console.error("Course flag update error code: FLAG_UPDATE_ERR");
           }
         }
 
         // Parse structured prescription JSON if in prescription_ocr mode
         let parsed: any = null;
         if (request_type === "prescription_ocr") {
-          try {
-            const raw = res.response.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
-            parsed = JSON.parse(raw);
-          } catch (e) {
-            console.error("Prescription JSON parse error:", e);
+          if (flagged) {
+            parsed = null;
+          } else {
+            try {
+              const raw = res.response.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+              parsed = JSON.parse(raw);
+            } catch (_parseErr) {
+              console.error("Prescription JSON parse error code: PARSE_ERR");
+            }
           }
         }
 
@@ -667,7 +808,7 @@ serve(async (req) => {
           { headers: { ...CORS, "Content-Type": "application/json" } }
         );
       } catch (err: any) {
-        console.error("Gemini failed:", err.message);
+        console.error("Gemini failed code: GEMINI_CALL_ERR");
         await logUsage(adminClient, userId, "gemini", request_type, 0, 0, err.name === "AbortError" ? "timeout" : "error");
       }
     } else {
@@ -681,46 +822,42 @@ serve(async (req) => {
         const res = await callOpenAICompatible(
           "https://api.groq.com/openai/v1/chat/completions",
           groqKey,
-          "llama-3.3-70b-versatile",
+          AI_MODELS.GROQ,
           messages,
           systemPrompt
         );
         await logUsage(adminClient, userId, "groq", request_type, res.tokens, res.latency, "success");
+
         const { safeText, flagged, guardTriggered } = applyGuardrails(query, res.response);
-        if (flagged) await logUsage(adminClient, userId, "guardrail", request_type, 0, 0, guardTriggered ?? "flagged");
+        if (flagged) {
+          await logUsage(adminClient, userId, "guardrail", request_type, 0, 0, guardTriggered ?? "flagged");
+        }
 
         let necessityFlag: NecessityFlag | null = null;
-        let dbUpdateData: any = null;
-        let dbUpdateError: any = null;
-        if (request_type === "symptom_to_care" && userContext.linked_course_id && userId) {
+        if (request_type === "symptom_to_care" && userContext.linked_course_id && !flagged) {
           necessityFlag = parseNecessityFlag(res.response);
           if (necessityFlag) {
-            console.error(`Updating DB for ${userContext.linked_course_id} user ${userId} to ${necessityFlag}`);
-            const result = await adminClient
+            const { error: updErr } = await adminClient
               .from("medication_courses")
               .update({ necessity_flag: necessityFlag })
               .eq("id", userContext.linked_course_id)
-              .eq("user_id", userId)
-              .select();
-            dbUpdateData = result.data;
-            dbUpdateError = result.error;
-            if (dbUpdateError) console.error("Update error:", dbUpdateError);
-            else console.error("Update success:", dbUpdateData);
+              .eq("user_id", userId);
+            if (updErr) console.error("Course flag update error code: FLAG_UPDATE_ERR");
           }
         }
 
         return new Response(
-          JSON.stringify({ 
-            text: safeText, 
-            provider: "groq", 
-            flagged, 
-            guardTriggered, 
-            necessityFlag
+          JSON.stringify({
+            text: safeText,
+            provider: "groq",
+            flagged,
+            guardTriggered,
+            necessityFlag,
           }),
           { headers: { ...CORS, "Content-Type": "application/json" } }
         );
       } catch (err: any) {
-        console.error("Groq failed:", err.message);
+        console.error("Groq failed code: GROQ_CALL_ERR");
         await logUsage(adminClient, userId, "groq", request_type, 0, 0, err.name === "AbortError" ? "timeout" : "error");
       }
     } else {
@@ -734,34 +871,43 @@ serve(async (req) => {
         const res = await callOpenAICompatible(
           "https://openrouter.ai/api/v1/chat/completions",
           openRouterKey,
-          "mistralai/mixtral-8x7b-instruct",
+          AI_MODELS.OPENROUTER,
           messages,
           systemPrompt
         );
         await logUsage(adminClient, userId, "openrouter", request_type, res.tokens, res.latency, "success");
+
         const { safeText, flagged, guardTriggered } = applyGuardrails(query, res.response);
+        if (flagged) {
+          await logUsage(adminClient, userId, "guardrail", request_type, 0, 0, guardTriggered ?? "flagged");
+        }
+
         return new Response(
           JSON.stringify({ text: safeText, provider: "openrouter", flagged, guardTriggered }),
           { headers: { ...CORS, "Content-Type": "application/json" } }
         );
       } catch (err: any) {
-        console.error("OpenRouter failed:", err.message);
+        console.error("OpenRouter failed code: OPENROUTER_CALL_ERR");
         await logUsage(adminClient, userId, "openrouter", request_type, 0, 0, err.name === "AbortError" ? "timeout" : "error");
       }
     } else {
       await logUsage(adminClient, userId, "openrouter", request_type, 0, 0, "skipped");
     }
 
-    // ── Tier 5: Hugging Face (text-only) ─────────────────────────────────────
-    // TODO: Implement HF Inference API call when HUGGINGFACE_API_KEY is set
-    const hfKey = Deno.env.get("HUGGINGFACE_API_KEY");
-    await logUsage(adminClient, userId, "huggingface", request_type, 0, 0, hfKey ? "skipped" : "skipped");
+    // ── Tier 5: Hugging Face (text-only stub) ─────────────────────────────────
+    // Architectural fallback stub: documented per project requirements.
+    // Intentionally not connected to a live inference endpoint at this time.
+    await logUsage(adminClient, userId, "huggingface", request_type, 0, 0, "skipped");
 
-    throw new Error("All AI providers exhausted, timed out, or keys missing.");
+    return new Response(
+      JSON.stringify({ error: "All AI providers exhausted, timed out, or unavailable.", code: "PROVIDERS_UNAVAILABLE" }),
+      { headers: { ...CORS, "Content-Type": "application/json" }, status: 503 }
+    );
 
   } catch (error: any) {
+    console.error("Unhandled handler error code: HANDLER_ERR");
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ error: error?.message || "Internal server error", code: "INTERNAL_ERROR" }),
       { headers: { ...CORS, "Content-Type": "application/json" }, status: 500 }
     );
   }

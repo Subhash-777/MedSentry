@@ -65,15 +65,17 @@ versions into the RN app:
 - On-device AI model as first-tier fallback so basic checks work offline
 
 ### 2.2 Family Circle Module (permissioned co-management)
-- **Family Circles**: shared workspace, created by an Owner, joined via invite code/QR
-- **Three permission tiers per member, per Circle** (not global):
-  - `viewer` — read-only: medication list, adherence %, next dose time
-  - `caregiver` — can add/edit a dependent's medications, adjust reminders, mark doses taken on
-    their behalf, initiate scans for them
-  - `owner` — full Circle control: invite/remove members, change roles, delete Circle
+- **Family Circles**: shared workspace, created by an Owner, joined via 6-character text invite code (e.g. `RAMIREZ2026`)
+- **Three permission tiers per member, per Circle** (strictly enforced via PostgreSQL RLS):
+  - `viewer` — read-only: full name, account type, medication list, adherence %, next dose time. Full health profile (clinical metrics, conditions, allergies) and symptom journal entries are private to the member, group owner, and caregivers only.
+  - `caregiver` — can view full health profile and symptom journal of circle members, add/edit a dependent's medications, adjust reminders, mark doses taken on their behalf, initiate scans for them.
+  - `owner` — full Circle control: view full health profile and symptom journal, invite/remove members, delete Circle.
+- **Privacy & Data Isolation (Decision D2 & D3)**:
+  - Viewer accounts cannot read other members' conditions, allergies, or symptom journal entries.
+  - No emergency contact details are shared across circle members.
 - **Self-sovereignty rule**: any adult member can downgrade anyone's edit access to their own
   data back to `viewer`-only at any time, overriding even the Owner — implemented as a
-  standing-consent flag the member controls from Settings, checked before any caregiver write.
+  standing-consent flag the member controls from Settings (`caregiver_consent_revoked`), checked before any caregiver write.
 - **Linked-Dependent mode**: a distinct `account_type = 'linked_dependent'` set at Circle-join
   time (for minors or elderly members who explicitly opt in) — persistent caregiver edit rights,
   not a silent escalation of a normal account.
@@ -81,7 +83,7 @@ versions into the RN app:
 - **Family antibiotic overlap warning**: flags simultaneous antibiotic courses within a Circle;
   surfaces hygiene tips and same-infection-spread detection.
 - **Shared medicine cabinet inventory**: Circle-level OTC stock list with expiry tracking.
-- **Audit trail**: every caregiver edit made on a dependent's behalf is logged and visible to the
+- **Audit trail**: every caregiver edit made on a dependent's behalf is logged into `caregiver_audit_log` and visible to the
   affected member.
 
 ### 2.3 Deep OCR Scanning

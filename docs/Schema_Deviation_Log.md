@@ -330,4 +330,117 @@ Format per entry:
 - **Decision**: Approved by user with explicit token `APPROVED: RUN MIGRATION` (2026-10-10).
 - **Status**: Applied (Executed via `supabase db push` on Live Database 2026-10-10; verified with `fuzzy_search_drug` live test returning Amoxicillin for 'Amoxlcillin' typo at 0.6 similarity score).
 
+---
+
+## Deviation #15 — Security Hardening & Rate-Limiting Index
+
+- **Date**: 2026-10-11 (Batch 1 Security Hardening)
+- **Migration file**: `20261011000001_security_hardening.sql`
+- **Change**:
+  ```sql
+  -- Pin search_path on caregiver and circle helper functions
+  ALTER FUNCTION public.check_caregiver_access(uuid, uuid) SET search_path = public, pg_temp;
+  ALTER FUNCTION public.check_caregiver_access_course(uuid, uuid) SET search_path = public, pg_temp;
+  ALTER FUNCTION public.check_circle_read_access(uuid, uuid) SET search_path = public, pg_temp;
+  ALTER FUNCTION public.check_circle_read_access_course(uuid, uuid) SET search_path = public, pg_temp;
+
+  -- Revoke anon access
+  REVOKE EXECUTE ON FUNCTION public.fuzzy_search_drug(text[]) FROM anon;
+  REVOKE EXECUTE ON FUNCTION public.get_amr_heatmap() FROM anon;
+
+  -- Cap fuzzy_search_drug query input and drop debug trigger function
+  DROP FUNCTION IF EXISTS public.test_trigger_debug();
+
+  -- Add 'prescription_ocr' to api_usage_logs request_type CHECK constraint
+  ALTER TABLE public.api_usage_logs
+      DROP CONSTRAINT IF EXISTS api_usage_logs_request_type_check;
+  ALTER TABLE public.api_usage_logs
+      ADD CONSTRAINT api_usage_logs_request_type_check
+      CHECK (request_type = ANY (ARRAY['consultant', 'chatbot', 'ocr_assist', 'suitability', 'symptom_to_care', 'visual_id', 'prescription_ocr']));
+
+  -- Index on api_usage_logs for per-user rate limit sliding window
+  CREATE INDEX IF NOT EXISTS idx_api_usage_logs_user_created ON public.api_usage_logs(user_id, created_at DESC);
+
+  -- Atomic dependent user cleanup RPC for admin-api (service_role only)
+  CREATE OR REPLACE FUNCTION public.admin_cleanup_user_data(target_id uuid)
+  RETURNS void ...
+  SECURITY DEFINER
+  SET search_path = public, pg_temp;
+  REVOKE EXECUTE ON FUNCTION public.admin_cleanup_user_data(uuid) FROM anon, authenticated;
+  GRANT EXECUTE ON FUNCTION public.admin_cleanup_user_data(uuid) TO service_role;
+  ```
+- **Why §4 wasn't sufficient**:
+  - Live security audit identified unpinned `search_path` on 4 `SECURITY DEFINER` functions, creating search_path escalation risk.
+  - `fuzzy_search_drug` and `get_amr_heatmap` had granted `EXECUTE` to `anon`, exposing drug queries and epidemiology data to unauthenticated callers.
+  - `test_trigger_debug()` was a leftover unreviewed debug function in the public schema.
+  - The `prescription_ocr` mode in `ai-router` was causing HTTP 500 crashes because `prescription_ocr` was absent from `api_usage_logs_request_type_check`.
+  - Rate limiting (10 req/min, 100 req/day) requires an indexed query on `(user_id, created_at DESC)`.
+  - Admin user deletion requires an atomic, idempotent database cleanup transaction (RPC) before Auth user deletion, preventing orphaned rows or broken foreign key constraints if network drops midway.
+- **Decision**: Approved by user with token `APPROVED: RUN MIGRATION` (2026-10-11).
+- **Status**: Applied (Executed on Live Database 2026-10-11; verified via pg_proc and routine_privileges).
+
+---
+
+## Deviation #16 — Batch 2 Privacy Enforcement (Decision D2)
+
+- **Date**: 2026-10-11 (Batch 2 Privacy Enforcement)
+- **Migration file**: `20261011000002_privacy_enforcement.sql`
+- **Change**:
+  ```sql
+  -- Helper function: is_admin() to safely check admin role without RLS recursion
+  CREATE OR REPLACE FUNCTION public.is_admin()
+  RETURNS boolean
+  LANGUAGE sql
+  SECURITY DEFINER
+  STABLE
+  SET search_path = public, pg_temp
+  AS $$
+    SELECT COALESCE((SELECT is_admin FROM public.profiles WHERE id = auth.uid()), false);
+  $$;
+  GRANT EXECUTE ON FUNCTION public.is_admin() TO authenticated;
+  REVOKE EXECUTE ON FUNCTION public.is_admin() FROM anon, PUBLIC;
+
+  -- Restrict profiles table reads to self, owner/caregivers of shared circle, or admins
+  DROP POLICY IF EXISTS "profiles: select circle members" ON public.profiles;
+  CREATE POLICY "profiles: select self or caregiver" ON public.profiles
+  FOR SELECT USING (
+    id = auth.uid() 
+    OR check_caregiver_access(id, auth.uid()) 
+    OR is_admin()
+  );
+
+  -- Restricted view for circle viewers (id, full_name, account_type only)
+  CREATE OR REPLACE VIEW public.circle_member_profiles
+  WITH (security_invoker = false)
+  AS
+  SELECT p.id, p.full_name, p.account_type
+  FROM public.profiles p
+  WHERE p.id = auth.uid() OR check_circle_read_access(p.id, auth.uid()) OR is_admin();
+
+  GRANT SELECT ON public.circle_member_profiles TO authenticated;
+  REVOKE SELECT ON public.circle_member_profiles FROM anon, PUBLIC;
+
+  -- Restricted RPC helper for fetching restricted profile of a circle member
+  CREATE OR REPLACE FUNCTION public.get_circle_member_profile(target_user_id uuid)
+  RETURNS TABLE (id uuid, full_name text, account_type text) ...
+  SECURITY DEFINER
+  SET search_path = public, pg_temp;
+
+  -- Restrict symptom_journal reads to entry owner, group owner/caregivers, and admins
+  DROP POLICY IF EXISTS "symptom_journal: select circle members" ON public.symptom_journal;
+  CREATE POLICY "symptom_journal: select self or caregiver" ON public.symptom_journal
+  FOR SELECT USING (
+    user_id = auth.uid() 
+    OR check_caregiver_access(user_id, auth.uid()) 
+    OR is_admin()
+  );
+  ```
+- **Why §4 wasn't sufficient**:
+  - The previous RLS policy `"profiles: select circle members"` allowed any circle member (including `viewer` roles) to query every column of other members' profiles, leaking sensitive health conditions, allergies, age, and physical metrics.
+  - The previous RLS policy `"symptom_journal: select circle members"` allowed any circle member to read all intimate symptom journal entries of another member.
+  - Per Decision D2 and plan.md §2.2, viewers must only see: full name, account type, medication list, adherence, and next dose. Full health profile (conditions, allergies, symptoms) is restricted to self, owner, and caregivers.
+- **Decision**: Final Decision D2 approved by user.
+- **Status**: Applied (Executed on Live Database 2026-10-11; verified via scripts/test_batch2_privacy_suite.py).
+
+
 

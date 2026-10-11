@@ -8,13 +8,13 @@ MedSentry is a state-of-the-art, mobile-first healthcare platform designed to co
 ## 🚀 Key Features & Modules
 
 ### 1. 📷 Smart OCR Prescription & Pill Strip Scanner
-* **Hybrid 2-Tier OCR Engine**: Combines low-latency, on-device text recognition (**Google ML Kit**) with cloud-scale multimodal vision (**Google Gemini 1.5 Flash**) for maximum speed and accuracy.
+* **Hybrid 2-Tier OCR Engine**: Combines low-latency, on-device text recognition (**Google ML Kit**, maintained as a known build dependency risk) with cloud-scale multimodal vision (**Google Gemini Flash Lite**) for maximum speed and accuracy.
 * **2D Spatial Layout Reconstruction**: Gathers bounding coordinates from ML Kit blocks and clusters lines sharing the same horizontal band ($\Delta y \le 65\%$ line height), sorting columns left-to-right. Preserves physical tabular rows so medication names, dosages, frequencies, and durations are never misaligned across table cells.
 * **Fuzzy Database Matching & Levenshtein Fallback**:
   * Employs PostgreSQL's native **`pg_trgm`** trigram similarity extension and GIN indexing (`idx_drugs_name_trgm`) via the `fuzzy_search_drug` database function.
   * Supplemented by client-side Levenshtein edit-distance calculations ($\ge 70\%$ similarity threshold) to effortlessly absorb OCR typographical errors (e.g. matching `Amoxlcillin` or `Paracetam0l` to their clean catalog counterparts).
 * **Multimodal AI Handwriting Reader**:
-  * An automated fallback and user-toggleable **"AI Doctor Handwriting Mode"** routes tricky or cursive prescriptions through the Supabase `ai-router` Edge Function to **Gemini 1.5 Flash Vision**.
+  * An automated fallback and user-toggleable **"AI Doctor Handwriting Mode"** routes tricky or cursive prescriptions through the Supabase `ai-router` Edge Function to **Gemini Flash Lite Vision**.
   * Formats clinical prescriptions into structured JSON schemas containing patient demographics, diagnosed conditions, doctor registration details, and medication courses.
 * **2D Barcode (GS1 DataMatrix & EAN-13) Auto-Scanner**:
   * Live camera stream automatically detects pharmaceutical **GS1 DataMatrix** 2D codes and standard barcodes.
@@ -26,7 +26,7 @@ MedSentry is a state-of-the-art, mobile-first healthcare platform designed to co
 * **Misuse Heatmap & Risk Scoring**: Automatically flags high-risk antibiotic usage ($K \ge 5$ threshold for unprescribed/overused Watch & Reserve tier drugs) to promote responsible prescribing.
 
 ### 3. 🤖 AI Health Consultant & Multi-Model Router (`ai-router`)
-* **Multi-Provider AI Routing**: Dynamically routes requests across **Google Gemini 1.5 Flash**, **Groq Llama 3**, and **DeepSeek AI** via Supabase Edge Functions.
+* **Multi-Provider AI Routing**: Dynamically routes requests across **Google Gemini** (`gemini-flash-lite-latest`), **Groq Llama 3** (`llama-3.3-70b-versatile`), and **OpenRouter** (`mistralai/mixtral-8x22b-instruct`) via Supabase Edge Functions. Hugging Face is maintained as an architectural stub.
 * **Clinical Request Modes**:
   1. `suitability` — Cross-references candidate medicines against active courses, known conditions, and drug interactions.
   2. `symptom_to_care` — Analyzes symptoms, correlates side effects, and outputs AWaRe necessity flags (`necessary`, `not_necessary`, `unclear`).
@@ -42,18 +42,21 @@ MedSentry is a state-of-the-art, mobile-first healthcare platform designed to co
   * **Image Scan Consultant**: Visual pill/strip identification and suitability analysis via camera or gallery photos (`launchCameraAsync`).
   * **AI Conversational Chatbot**: Multi-turn routine-aware health assistant for daily medication advice.
 
-### 4. 👨‍👩‍👧‍👦 Family Circles & Caregiver Self-Sovereignty
-* **Shared Family Circles**: Create or join family groups via secure 6-character invite codes (`RAMIREZ2026`).
-* **Role-Based Access Control (RBAC)**: Supports `OWNER`, `CAREGIVER`, and `VIEWER` roles.
+### 4. 👨‍👩‍👧‍👦 Family Circles & Privacy-Enforced RBAC
+* **Shared Family Circles**: Create or join family groups via secure 6-character text invite codes (e.g. `RAMIREZ2026`). No QR joining.
+* **Strict Privacy Enforcement (Decision D2 & D3)**:
+  * `VIEWER`: Read-only access to member full name, account type, active medication list, adherence %, and next dose time. Clinical physical metrics (age, weight, height), known medical conditions, allergies, and symptom journal entries are completely hidden and enforced by database Row Level Security.
+  * `CAREGIVER` & `OWNER`: Full visibility of health profiles and symptom journals for shared circle members.
+  * **Zero Emergency Contact Sharing**: Emergency contact details are never shared across circle members.
 * **Standing Caregiver Consent Management**: Empowers adult members to toggle caregiver edit permissions on/off (`caregiver_consent_revoked`) at any time for complete privacy sovereignty.
 * **Caregiver Audit Trail**: Automatically logs every edit or dose logged by a caregiver on a dependent's behalf into `public.caregiver_audit_log`.
 * **Medicine Cabinet Inventory**: Shared OTC inventory tracker with 30-day near-expiry warnings and stock management.
 
 ### 5. 🩺 Caregiver Dependent Profile Access
 * **Interactive Member Cards**: Caregivers and circle members can tap any member card in `FamilyCircleScreen` to view their detailed profile (`MemberProfileScreen.tsx`).
-* **Medical Safety Profile**: Displays age, weight, height, known medical conditions (*e.g. Type 2 Diabetes, Arthritis*), and drug allergies (*e.g. Sulfa*).
-* **Dependent Course Overview**: Renders active medication courses, AWaRe badges, dosage schedules, and days-remaining progress bars.
-* **Proxy Dose Logging**: Enables authorized caregivers to tap **"Log Dose for Member"** directly from the profile view to record adherence on their dependent's behalf.
+* **Role-Gated Medical Profile**: Displays age, weight, height, known medical conditions, and drug allergies to Owner and Caregiver roles only. Displays a privacy protection notice to Viewers.
+* **Dependent Course Overview**: Renders active medication courses, AWaRe badges, dosage schedules, and days-remaining progress bars to all circle members.
+* **Proxy Dose Logging**: Enables authorized caregivers to tap **"Log Dose for Member"** directly from the profile view to record adherence on their dependent's behalf. Viewers have read-only access.
 
 ### 6. 📔 Symptom Journal & Side-Effect Correlation
 * **Rich Symptom Logging**: Record symptoms with 1–10 severity ratings, onset duration (`Just started`, `< 24h`, `1-3 days`, `4-7 days`, `> 1 week`), body system category tags (`Head & Brain`, `Stomach & Digestive`, `Skin & Rash`, `Respiratory`, `Muscle & Joint`, `General / Other`), and visual symptom photo attachments.

@@ -13,8 +13,12 @@ try:
 except Exception:
     anon_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." # Will rely on the grep
 
-# Use local DB URL
-db_url = "postgresql://postgres:postgres@127.0.0.1:54322/postgres"
+# Load environment
+load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+db_url = os.environ.get("SUPABASE_DB_URL")
+if not db_url:
+    print("Error: SUPABASE_DB_URL environment variable is missing. Set it in scripts/.env")
+    exit(1)
 
 def get_token():
     res = requests.post(

@@ -57,10 +57,18 @@ serve(async (req) => {
         supabaseAdmin.from('caregiver_audit_log').select('*').order('created_at', { ascending: false }).limit(100)
       ])
 
-      const authUsersMap = new Map((authUsersRes.data?.users || []).map((u: any) => [u.id, u]))
+      const profilesMap = new Map((profilesRes.data || []).map((p: any) => [p.id, p]))
+      const authUsers = authUsersRes.data?.users || []
 
-      const enrichedUsers = (profilesRes.data || []).map((p: any) => {
-        const authUser = authUsersMap.get(p.id)
+      // Map over all auth users: ensures users whose DB data was cleaned but Auth deletion failed remain visible for retry
+      const enrichedUsers = authUsers.map((authUser: any) => {
+        const p = profilesMap.get(authUser.id) || {
+          id: authUser.id,
+          full_name: authUser.user_metadata?.full_name || 'Auth User (Pending Auth Deletion)',
+          account_type: 'individual',
+          is_admin: false,
+          created_at: authUser.created_at,
+        }
         return {
           ...p,
           email: authUser?.email || null,
@@ -82,7 +90,7 @@ serve(async (req) => {
     }
 
     // Server-side validation for destructive/corrective actions
-    if (['deactivate_user', 'activate_user', 'delete_user', 'update_profile', 'disband_circle'].includes(action)) {
+    if (['deactivate_user', 'activate_user', 'delete_user', 'demote_admin', 'update_profile', 'disband_circle'].includes(action)) {
       if (!payload?.reason || payload.reason.trim() === '') {
         return new Response(JSON.stringify({ error: 'A mandatory reason must be provided for this action.' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
       }
@@ -103,12 +111,26 @@ serve(async (req) => {
     }
 
     if (action === 'deactivate_user') {
-      const { error: banError } = await supabaseAdmin.auth.admin.updateUserById(payload.target_user_id, { ban_duration: '876000h' })
+      const target_id = payload.target_user_id;
+      if (target_id === user.id) {
+        return new Response(JSON.stringify({ error: 'Cannot deactivate your own administrator account.' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+      }
+
+      // Safeguard: Do not deactivate the last remaining admin
+      const { data: targetProf } = await supabaseAdmin.from('profiles').select('is_admin').eq('id', target_id).single()
+      if (targetProf?.is_admin) {
+        const { count } = await supabaseAdmin.from('profiles').select('*', { count: 'exact', head: true }).eq('is_admin', true)
+        if ((count ?? 0) <= 1) {
+          return new Response(JSON.stringify({ error: 'Cannot deactivate the last remaining administrator.' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+        }
+      }
+
+      const { error: banError } = await supabaseAdmin.auth.admin.updateUserById(target_id, { ban_duration: '876000h' })
       if (banError) throw banError
 
       await supabaseAdmin.from('admin_audit_log').insert({
         admin_id: user.id,
-        target_user_id: payload.target_user_id,
+        target_user_id: target_id,
         action: 'deactivate_user',
         details: { reason: payload.reason }
       })
@@ -128,28 +150,92 @@ serve(async (req) => {
       return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
     }
 
-    if (action === 'delete_user') {
+    if (action === 'demote_admin') {
       const target_id = payload.target_user_id;
+      if (target_id === user.id) {
+        return new Response(JSON.stringify({ error: 'Cannot demote your own administrator account.' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+      }
 
-      // 1. Log administrative audit entry prior to deletion
+      // Safeguard: Do not demote the last remaining admin
+      const { count } = await supabaseAdmin.from('profiles').select('*', { count: 'exact', head: true }).eq('is_admin', true)
+      if ((count ?? 0) <= 1) {
+        return new Response(JSON.stringify({ error: 'Cannot demote the last remaining administrator.' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+      }
+
+      const { data, error } = await supabaseAdmin.from('profiles').update({ is_admin: false }).eq('id', target_id).select().single()
+      if (error) throw error
+
       await supabaseAdmin.from('admin_audit_log').insert({
         admin_id: user.id,
         target_user_id: target_id,
-        action: 'delete_user',
+        action: 'demote_admin',
+        details: { reason: payload.reason }
+      })
+      return new Response(JSON.stringify({ success: true, profile: data }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+    }
+
+    if (action === 'delete_user') {
+      const target_id = payload.target_user_id;
+      if (target_id === user.id) {
+        return new Response(JSON.stringify({ error: 'Cannot delete your own administrator account.' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+      }
+
+      // Safeguard: Do not delete the last remaining admin
+      const { data: targetProf } = await supabaseAdmin.from('profiles').select('is_admin').eq('id', target_id).single()
+      if (targetProf?.is_admin) {
+        const { count } = await supabaseAdmin.from('profiles').select('*', { count: 'exact', head: true }).eq('is_admin', true)
+        if ((count ?? 0) <= 1) {
+          return new Response(JSON.stringify({ error: 'Cannot delete the last remaining administrator.' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+        }
+      }
+
+      // Step 1: Audit log the deletion initiation
+      await supabaseAdmin.from('admin_audit_log').insert({
+        admin_id: user.id,
+        target_user_id: target_id,
+        action: 'delete_user_attempt',
         details: { reason: payload.reason }
       })
 
-      // 2. Delete user from Auth FIRST (GoTrue Admin API).
-      // If GoTrue fails or throws, execution stops immediately and NO profile/database data is deleted.
-      const { error: delError } = await supabaseAdmin.auth.admin.deleteUser(target_id)
-      if (delError) {
-        throw new Error(`Auth user deletion failed: ${delError.message || JSON.stringify(delError)}`)
+      // Step 2: Atomic dependent database cleanup in one transaction via RPC
+      const { error: rpcErr } = await supabaseAdmin.rpc('admin_cleanup_user_data', { target_id })
+      if (rpcErr) {
+        await supabaseAdmin.from('admin_audit_log').insert({
+          admin_id: user.id,
+          target_user_id: target_id,
+          action: 'delete_user_db_cleanup_failed',
+          details: { error: rpcErr.message, reason: payload.reason }
+        })
+        throw new Error(`Database cleanup failed: ${rpcErr.message}`)
       }
 
-      // 3. Clean up any remaining database rows (Postgres ON DELETE CASCADE will also fire automatically)
-      await supabaseAdmin.from('medication_courses').delete().eq('user_id', target_id)
-      await supabaseAdmin.from('family_members').delete().eq('member_id', target_id)
-      await supabaseAdmin.from('profiles').delete().eq('id', target_id)
+      await supabaseAdmin.from('admin_audit_log').insert({
+        admin_id: user.id,
+        target_user_id: target_id,
+        action: 'delete_user_db_cleanup_completed',
+        details: { reason: payload.reason }
+      })
+
+      // Step 3: Delete from Supabase Auth (GoTrue Admin API)
+      const { error: authDelError } = await supabaseAdmin.auth.admin.deleteUser(target_id)
+      if (authDelError) {
+        // Auth deletion failed: user remains listed in Auth and in get_dashboard_data for safe retry
+        await supabaseAdmin.from('admin_audit_log').insert({
+          admin_id: user.id,
+          target_user_id: target_id,
+          action: 'delete_user_auth_failed',
+          details: { error: authDelError.message, reason: payload.reason }
+        })
+        throw new Error(`Auth user deletion failed: ${authDelError.message}`)
+      }
+
+      // Step 4: Log successful completion
+      await supabaseAdmin.from('admin_audit_log').insert({
+        admin_id: user.id,
+        target_user_id: target_id,
+        action: 'delete_user_completed',
+        details: { reason: payload.reason, status: 'completed' }
+      })
 
       return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
     }
@@ -201,7 +287,7 @@ serve(async (req) => {
 
     return new Response(JSON.stringify({ error: 'Unknown action' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
 
-  } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+  } catch (error: any) {
+    return new Response(JSON.stringify({ error: error?.message || 'Server error' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
   }
 })
