@@ -442,5 +442,71 @@ Format per entry:
 - **Decision**: Final Decision D2 approved by user.
 - **Status**: Applied (Executed on Live Database 2026-10-11; verified via scripts/test_batch2_privacy_suite.py).
 
+---
+
+## Deviation #17 — Medication Knowledge & India-Focused OTC Formulary Layer
+
+- **Date**: 2026-10-12 (Batches B, C, & D Deployment)
+- **Migration file**: `20261012000001_medication_knowledge_otc_formulary.sql`
+- **Change**:
+  ```sql
+  -- 1. Enhance public.drugs with clinical, formulary, and provenance columns
+  ALTER TABLE public.drugs
+    ADD COLUMN IF NOT EXISTS brand_names text[],
+    ADD COLUMN IF NOT EXISTS active_ingredients text[],
+    ADD COLUMN IF NOT EXISTS strength text,
+    ADD COLUMN IF NOT EXISTS dosage_form text,
+    ADD COLUMN IF NOT EXISTS route text,
+    ADD COLUMN IF NOT EXISTS indications text,
+    ADD COLUMN IF NOT EXISTS contraindications text,
+    ADD COLUMN IF NOT EXISTS precautions text,
+    ADD COLUMN IF NOT EXISTS prescription_status_india text DEFAULT 'unverified',
+    ADD COLUMN IF NOT EXISTS schedule_category_india text DEFAULT 'unverified',
+    ADD COLUMN IF NOT EXISTS status_verification text DEFAULT 'unverified',
+    ADD COLUMN IF NOT EXISTS verification_source text,
+    ADD COLUMN IF NOT EXISTS source_url text,
+    ADD COLUMN IF NOT EXISTS source_version text,
+    ADD COLUMN IF NOT EXISTS verification_date date,
+    ADD COLUMN IF NOT EXISTS classification_notes text;
+
+  -- 2. Create authoritative India medication formulary table
+  CREATE TABLE IF NOT EXISTS public.medication_formulary_india (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    generic_name text NOT NULL,
+    brand_names text[],
+    active_ingredients text[] NOT NULL,
+    strength text,
+    dosage_form text,
+    route text,
+    prescription_status text NOT NULL CHECK (prescription_status IN ('OTC', 'prescription_only', 'restricted', 'unverified')),
+    schedule_category text NOT NULL,
+    status_verification text NOT NULL CHECK (status_verification IN ('verified_authoritative', 'provisional_evidence', 'unverified')),
+    legal_basis text NOT NULL,
+    source_organization text NOT NULL,
+    source_url text,
+    source_version text,
+    verification_date date NOT NULL DEFAULT CURRENT_DATE,
+    indications text,
+    contraindications text,
+    precautions text,
+    adverse_effects text,
+    max_otc_dose_adult text,
+    classification_notes text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+  );
+
+  ALTER TABLE public.medication_formulary_india ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY "medication_formulary_india: authenticated read"
+    ON public.medication_formulary_india FOR SELECT TO authenticated
+    USING (auth.role() = 'authenticated'::text);
+  ```
+- **Why §4 wasn't sufficient**:
+  - plan.md §4 only included US/global drug catalogs (`drugs` and `drug_interactions`) without Indian regulatory classifications (CDSCO, Drugs & Cosmetics Rules 1945 Schedules H/H1/K/X, and IPC monographs).
+  - To prevent catastrophic medical misinformation (such as recommending systemic antibiotics as OTC under Indian law or failing to cite CDSCO Gazette schedules for household remedies), an authoritative regulatory formulary layer (`medication_formulary_india`) and provenance columns were required.
+- **Decision**: Approved and validated under Batches B, C, and D evaluation loops (2026-10-12).
+- **Status**: Applied (Executed on Live Database 2026-10-12; verified via `scripts/test_batch_b_knowledge.py` and `scripts/run_batch_c_eval.py`).
+
+
 
 

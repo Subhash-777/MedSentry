@@ -45,7 +45,7 @@ const MedicationCard = React.memo(({ item, index, loggingDose, onLogDose, onDele
       <View style={styles.cardBody}>
         <View style={styles.cardHeader}>
           <View style={styles.cardHeaderLeft}>
-            <Text style={styles.drugName} numberOfLines={1}>{drugName}</Text>
+            <Text style={styles.drugName} numberOfLines={2}>{drugName}</Text>
             {item.drug?.aware_class ? (
               <View style={[styles.awareBadge, { backgroundColor: awareStyle.bg, borderColor: awareStyle.border }]}>
                 <Text style={[styles.awareBadgeText, { color: awareStyle.text }]}>
@@ -293,7 +293,7 @@ export default function MyMedicationsScreen() {
       const { error } = await (supabase.from('dose_logs') as any).insert({ course_id: courseId, status: 'taken' });
       if (error) throw error;
       Alert.alert('✅ Dose Logged', 'Great job staying on track! Keep it up.');
-    } catch (err: any) {
+    } catch {
       Alert.alert('Error', 'Failed to log dose.');
     } finally {
       setLoggingDose(null);
@@ -345,10 +345,10 @@ export default function MyMedicationsScreen() {
       <Animated.View entering={FadeInDown.duration(400)} style={styles.header}>
         <Text style={styles.title}>My Medications</Text>
         {courses.length > 0 && (
-          <TouchableOpacity style={styles.countBadge} onPress={() => setModalVisible(true)}>
-            <Plus size={14} color={T.sageGreenSolid} style={{ marginRight: 4 }} />
-            <Text style={styles.countText}>Add ({courses.length})</Text>
-          </TouchableOpacity>
+          <View style={styles.countBadge} accessibilityLabel={`${courses.length} active medications`}>
+            <Pill size={13} color={T.sageGreenSolid} style={{ marginRight: 5 }} />
+            <Text style={styles.countText}>{courses.length} Active</Text>
+          </View>
         )}
       </Animated.View>
 
@@ -573,7 +573,7 @@ const styles = StyleSheet.create({
   },
   countText: { fontSize: T.fontSize.caption, fontWeight: '700', color: T.sageGreenSolid },
 
-  list: { paddingHorizontal: 16, paddingBottom: 100, paddingTop: 12 },
+  list: { paddingHorizontal: 16, paddingBottom: 150, paddingTop: 12 },
 
   // Card
   card: {

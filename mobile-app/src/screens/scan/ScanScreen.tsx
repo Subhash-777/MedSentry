@@ -10,7 +10,7 @@ import Animated, {
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { useNavigation } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import { Pill, FileText, Camera, Sparkles } from 'lucide-react-native';
+import { Pill, FileText, Sparkles, Zap, ZapOff } from 'lucide-react-native';
 import { ScanStackParamList } from '../../navigation/AppNavigator';
 import {
   recognizeTextFromImage, findDrugFromOcrText,
@@ -60,6 +60,7 @@ export default function ScanScreen() {
   const [permission, requestPermission] = useCameraPermissions();
   const [isScanning, setIsScanning] = useState(false);
   const [cameraActive, setCameraActive] = useState(true);
+  const [torchActive, setTorchActive] = useState(false);
   const [scanMode, setScanMode] = useState<ScanMode>('medicine');
   const [useAiVision, setUseAiVision] = useState(false);
   const [statusMessage, setStatusMessage] = useState('Analyzing image with OCR...');
@@ -72,7 +73,13 @@ export default function ScanScreen() {
       setCameraActive(true);
       lastBarcodeRef.current = null;
     });
-    return unsub;
+    const unsubBlur = navigation.addListener('blur', () => {
+      setTorchActive(false);
+    });
+    return () => {
+      unsub();
+      unsubBlur();
+    };
   }, [navigation]);
 
   if (!permission) return <View style={styles.container} />;
@@ -272,6 +279,7 @@ export default function ScanScreen() {
             style={StyleSheet.absoluteFill} 
             ref={cameraRef} 
             facing="back"
+            enableTorch={torchActive}
             barcodeScannerSettings={scanMode === 'medicine' ? {
               barcodeTypes: ['datamatrix', 'qr', 'ean13', 'code128', 'upc_a'],
             } : undefined}
@@ -280,6 +288,26 @@ export default function ScanScreen() {
           <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
             {/* Dim overlay */}
             <View style={styles.dimOverlay} />
+
+            {/* Flash / Torch Toggle Control (User-controllable, manual) */}
+            <Animated.View entering={FadeIn.duration(300)} style={styles.flashButtonWrap}>
+              <TouchableOpacity
+                style={[styles.flashToggleBtn, torchActive && styles.flashToggleBtnActive]}
+                onPress={() => setTorchActive((prev) => !prev)}
+                activeOpacity={0.7}
+                accessibilityRole="button"
+                accessibilityLabel={torchActive ? 'Turn off camera flash' : 'Turn on camera flash'}
+              >
+                {torchActive ? (
+                  <Zap size={16} color="#F59E0B" fill="#F59E0B" />
+                ) : (
+                  <ZapOff size={16} color="rgba(255,255,255,0.85)" />
+                )}
+                <Text style={[styles.flashToggleText, torchActive && styles.flashToggleTextActive]}>
+                  {torchActive ? 'Flash ON' : 'Flash'}
+                </Text>
+              </TouchableOpacity>
+            </Animated.View>
 
             {/* Bright scan frame cutout */}
             <View style={styles.frameContainer}>
@@ -430,6 +458,41 @@ const styles = StyleSheet.create({
   dimOverlay: {
     ...StyleSheet.absoluteFill,
     backgroundColor: 'rgba(0,0,0,0.5)',
+  },
+  flashButtonWrap: {
+    position: 'absolute',
+    top: 14,
+    right: 16,
+    zIndex: 20,
+  },
+  flashToggleBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    borderColor: 'rgba(255, 255, 255, 0.25)',
+    borderWidth: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 20,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  flashToggleBtnActive: {
+    backgroundColor: 'rgba(245, 158, 11, 0.25)',
+    borderColor: '#F59E0B',
+  },
+  flashToggleText: {
+    color: '#FFF',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  flashToggleTextActive: {
+    color: '#F59E0B',
+    fontWeight: '700',
   },
   frameContainer: {
     ...StyleSheet.absoluteFill,

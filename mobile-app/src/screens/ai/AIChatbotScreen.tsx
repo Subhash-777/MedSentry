@@ -1,13 +1,19 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { View, Text, StyleSheet, TextInput, TouchableOpacity, ScrollView, ActivityIndicator, Keyboard, Platform } from 'react-native';
-import { invokeAIRouter, AIMessage } from '../../lib/aiRouterClient';
+import { invokeAIRouter, AIMessage, StructuredRetrieval } from '../../lib/aiRouterClient';
 import { useAuth } from '../../context/AuthContext';
+import { SafeMarkdown } from '../../components/common/SafeMarkdown';
+import { SourceAttributionCard } from '../../components/ai/SourceAttributionCard';
 import * as T from '../../theme/colors';
+
+export interface ChatbotMessage extends AIMessage {
+  retrieval?: StructuredRetrieval | null;
+}
 
 export default function AIChatbotScreen() {
   const { profile } = useAuth();
   const [input, setInput] = useState('');
-  const [messages, setMessages] = useState<AIMessage[]>([]);
+  const [messages, setMessages] = useState<ChatbotMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const scrollViewRef = useRef<ScrollView>(null);
@@ -30,7 +36,7 @@ export default function AIChatbotScreen() {
   const sendMessage = async () => {
     if (!input.trim()) return;
 
-    const userMessage: AIMessage = { role: 'user', content: input.trim() };
+    const userMessage: ChatbotMessage = { role: 'user', content: input.trim() };
     const newMessages = [...messages, userMessage];
     
     setMessages(newMessages);
@@ -38,9 +44,13 @@ export default function AIChatbotScreen() {
     setLoading(true);
 
     try {
-      const res = await invokeAIRouter('chatbot', newMessages, undefined, { userId: profile?.id });
+      const apiMessages: AIMessage[] = newMessages.map((m) => ({
+        role: m.role,
+        content: m.content,
+      }));
+      const res = await invokeAIRouter('chatbot', apiMessages, undefined, { userId: profile?.id });
       
-      setMessages([...newMessages, { role: 'assistant', content: res.text }]);
+      setMessages([...newMessages, { role: 'assistant', content: res.text, retrieval: res.retrieval }]);
     } catch (err: any) {
       setMessages([...newMessages, { role: 'assistant', content: 'Error: ' + err.message }]);
     } finally {
@@ -69,7 +79,14 @@ export default function AIChatbotScreen() {
 
         {messages.map((msg, index) => (
           <View key={index} style={[styles.bubble, msg.role === 'user' ? styles.userBubble : styles.botBubble]}>
-            <Text style={[styles.bubbleText, msg.role === 'user' ? styles.userBubbleText : styles.botBubbleText]}>{msg.content}</Text>
+            {msg.role === 'user' ? (
+              <Text style={styles.userBubbleText}>{msg.content}</Text>
+            ) : (
+              <>
+                <SafeMarkdown content={msg.content} />
+                <SourceAttributionCard retrieval={msg.retrieval} />
+              </>
+            )}
           </View>
         ))}
 

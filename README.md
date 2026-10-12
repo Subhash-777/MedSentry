@@ -19,6 +19,11 @@ MedSentry is a state-of-the-art, mobile-first healthcare platform designed to co
 * **2D Barcode (GS1 DataMatrix & EAN-13) Auto-Scanner**:
   * Live camera stream automatically detects pharmaceutical **GS1 DataMatrix** 2D codes and standard barcodes.
   * Decodes Application Identifiers: `(01)` GTIN, `(17)` Expiry Date (`YYMMDD`), and `(10)` Batch Number, instantly warning users if a scanned medication has expired.
+* **Manual Flash / Torch Lighting Control**:
+  * Integrated user-togglable torch (`enableTorch={torchActive}`) with intuitive `Zap` / `ZapOff` icon controls for reliable low-light scanning.
+  * Integrated screen blur and navigation lifecycle listeners that automatically extinguish the torch when switching tabs to conserve battery.
+* **Dual-Field Candidate Matching**:
+  * Enhanced OCR search (`ocr.ts`) to match scanned text across both brand names and generic active ingredient names against the catalog and India formulary.
 * **Clinical Verification Screen**: Interactive confirmation screen (`VerifyPrescriptionScreen.tsx`) allowing users to review, edit, and confirm extracted medicine names, doses, frequencies, and instructions prior to adding courses to their adherence tracker.
 
 ### 2. 🌍 WHO AWaRe Antibiotic Classification System
@@ -28,10 +33,16 @@ MedSentry is a state-of-the-art, mobile-first healthcare platform designed to co
 ### 3. 🤖 AI Health Consultant & Multi-Model Router (`ai-router`)
 * **Multi-Provider AI Routing**: Dynamically routes requests across **Google Gemini** (`gemini-flash-lite-latest`), **Groq Llama 3** (`llama-3.3-70b-versatile`), and **OpenRouter** (`mistralai/mixtral-8x22b-instruct`) via Supabase Edge Functions. Hugging Face is maintained as an architectural stub.
 * **Clinical Request Modes**:
-  1. `suitability` — Cross-references candidate medicines against active courses, known conditions, and drug interactions.
+  1. `suitability` / `consultant` — Evaluates candidate medicines against active courses, known conditions, and drug interactions, with full multimodal packaging vision.
   2. `symptom_to_care` — Analyzes symptoms, correlates side effects, and outputs AWaRe necessity flags (`necessary`, `not_necessary`, `unclear`).
   3. `visual_id` — Visual pill, blister strip, or packaging identification from captured images.
   4. `prescription_ocr` — Clinical multimodal extraction of complex and cursive handwritten doctor prescriptions.
+* **Multimodal Vision Engine & In-Chat Attachment**:
+  * Seamlessly passes image payloads (`inline_data` base64) to Google Gemini within multi-turn conversation histories.
+  * Explicit visual inspection prompts direct the AI to read packaging details, brand names (e.g. *Daflon 500mg*), active ingredients (*Micronized Purified Flavonoid Fraction*), and strengths directly from photos.
+  * In-chat attachment picker (`promptImageSource`) lets users snap photos with the camera or select from the gallery mid-consultation.
+* **Post-Inference Catalog Resolution**:
+  * Automatically cross-references medicines identified by Gemini against the official Indian CDSCO formulary to attach verified Schedule H/K records, interaction analyses, and source attributions.
 * **Deterministic Server-Side Allergy Pre-Check**: Performs a pre-flight string/category match between the user's recorded allergies (`profiles.allergies`) and target drug data (`drugs.name`, `category`, `aware_class`), injecting a high-priority `CRITICAL SAFETY WARNING` before the LLM generates its response.
 * **Structured Medical Context Injection**: Injects user demographics (age, weight, height), known conditions, recorded allergies, 7-day adherence trends, and active medication courses into system prompts.
 * **3-Tier Clinical Guardrails**:
@@ -42,7 +53,19 @@ MedSentry is a state-of-the-art, mobile-first healthcare platform designed to co
   * **Image Scan Consultant**: Visual pill/strip identification and suitability analysis via camera or gallery photos (`launchCameraAsync`).
   * **AI Conversational Chatbot**: Multi-turn routine-aware health assistant for daily medication advice.
 
-### 4. 👨‍👩‍👧‍👦 Family Circles & Privacy-Enforced RBAC
+### 4. 🏛️ Indian CDSCO Formulary & Evidence Attribution Engine
+* **Authoritative National Formulary (`medication_formulary_india`)**:
+  * Sourced from the **Central Drugs Standard Control Organisation (CDSCO)**, **Drugs & Cosmetics Rules 1945**, Schedules H/H1/K/X, and the **Indian Pharmacopoeia Commission (IPC)**.
+  * Enforces statutory prescription status (`OTC` vs `prescription_only`), legal bases (e.g. Schedule K Item 23), and verification tiers (`verified_authoritative`, `provisional_evidence`, `unverified`).
+* **Strict Antibiotic Invariant**:
+  * Under Indian regulatory law and NAP-AMR, enforces that **all systemic antibiotics are strictly Prescription-Only (Schedule H/H1)** and can never be claimed as OTC.
+* **Redesigned Source Attribution Cards (`SourceAttributionCard.tsx`)**:
+  * Responsive single-column vertical stacked card design eliminating awkward syllable line-wrapping.
+  * Displays full medicine names, active ingredients, authoritative verification badges, statutory schedules, and sanitized external reference URLs.
+* **AST-Based Medical Markdown Renderer (`SafeMarkdown.tsx`)**:
+  * Custom token-aware AST parser rendering structured clinical notes, bulleted lists, and statutory warnings cleanly without raw markup artifacts.
+
+### 5. 👨‍👩‍👧‍👦 Family Circles & Privacy-Enforced RBAC
 * **Shared Family Circles**: Create or join family groups via secure 6-character text invite codes (e.g. `RAMIREZ2026`). No QR joining.
 * **Strict Privacy Enforcement (Decision D2 & D3)**:
   * `VIEWER`: Read-only access to member full name, account type, active medication list, adherence %, and next dose time. Clinical physical metrics (age, weight, height), known medical conditions, allergies, and symptom journal entries are completely hidden and enforced by database Row Level Security.
@@ -52,28 +75,28 @@ MedSentry is a state-of-the-art, mobile-first healthcare platform designed to co
 * **Caregiver Audit Trail**: Automatically logs every edit or dose logged by a caregiver on a dependent's behalf into `public.caregiver_audit_log`.
 * **Medicine Cabinet Inventory**: Shared OTC inventory tracker with 30-day near-expiry warnings and stock management.
 
-### 5. 🩺 Caregiver Dependent Profile Access
+### 6. 🩺 Caregiver Dependent Profile Access
 * **Interactive Member Cards**: Caregivers and circle members can tap any member card in `FamilyCircleScreen` to view their detailed profile (`MemberProfileScreen.tsx`).
 * **Role-Gated Medical Profile**: Displays age, weight, height, known medical conditions, and drug allergies to Owner and Caregiver roles only. Displays a privacy protection notice to Viewers.
 * **Dependent Course Overview**: Renders active medication courses, AWaRe badges, dosage schedules, and days-remaining progress bars to all circle members.
 * **Proxy Dose Logging**: Enables authorized caregivers to tap **"Log Dose for Member"** directly from the profile view to record adherence on their dependent's behalf. Viewers have read-only access.
 
-### 6. 📔 Symptom Journal & Side-Effect Correlation
+### 7. 📔 Symptom Journal & Side-Effect Correlation
 * **Rich Symptom Logging**: Record symptoms with 1–10 severity ratings, onset duration (`Just started`, `< 24h`, `1-3 days`, `4-7 days`, `> 1 week`), body system category tags (`Head & Brain`, `Stomach & Digestive`, `Skin & Rash`, `Respiratory`, `Muscle & Joint`, `General / Other`), and visual symptom photo attachments.
 * **Medication Linking**: Links symptoms directly to active medication courses (`linked_course_id`) for side-effect correlation.
 * **Status Toggles**: Easily toggle entries between `ongoing` and `resolved`.
 
-### 7. 🔍 Direct Medicine Search & Custom Catalog Fallback
+### 8. 🔍 Direct Medicine Search & Custom Catalog Fallback
 * **Typeahead Catalog Search**: Instant search querying 752 catalog drugs in `public.drugs`.
 * **"Scan Instead" Secondary Path**: Prominent option navigating directly to OCR scanner.
 * **Unmatched Custom Drug Fallback**: Option `"Can't find 'X'? Add as custom medication"` allows tracking 100% of unlisted drugs.
 * **Analytics Demand Logging**: Logs unmatched drug searches into `public.api_usage_logs` (`provider_name = 'missing_drug_search'`) to track catalog expansion demand.
 
-### 8. 🎮 Gamified Adherence & Automated Badges
+### 9. 🎮 Gamified Adherence & Automated Badges
 * **Adherence Streak Tracking**: Automatically evaluates dose logging frequency via PostgreSQL database triggers (`trg_evaluate_badges` on `public.user_badges`).
 * **Unlocked Badges**: Awards badges such as `first_dose_logged` and `7_day_streak`.
 
-### 9. 📊 Admin Portal & Regional AMR Surveillance
+### 10. 📊 Admin Portal & Regional AMR Surveillance
 * **Executive Dashboard**: System metrics on active users, antibiotic compliance rates, API usage logs, and dataset refresh status (`dataset_sync_log`).
 * **Atomic Account Deletion**: Secure GoTrue Admin API integration ensuring clean multi-table user deletion.
 * **Community Misuse Heatmap**: Opt-in anonymized state/province regional tracking (`profiles.region`).
@@ -85,11 +108,41 @@ MedSentry is a state-of-the-art, mobile-first healthcare platform designed to co
 1. **WHO AWaRe Classification Dataset (2023)**:
    * 750+ essential medicines categorized into **Access**, **Watch**, **Reserve**, and **Not Recommended** antibiotic tiers.
    * Embedded into `public.drugs.aware_class`.
-2. **FDA & DailyMed Reference Drug Database**:
+2. **CDSCO National Formulary & Drugs & Cosmetics Rules 1945**:
+   * Official Indian statutory classification covering Schedules H, H1, K, and X.
+   * Authoritative regulatory basis and verification sources stored in `public.medication_formulary_india` and `public.drugs`.
+   * Enforces zero-antibiotic OTC exemptions and includes recent essential formulations (e.g. Daflon 500mg flavonoid fraction).
+3. **FDA & DailyMed Reference Drug Database**:
    * Drug formulations, common clinical uses, side effects, and warning notes stored in `public.drugs`.
    * Drug-drug interaction pairs and severity descriptions stored in `public.drug_interactions`.
-3. **Regional Opt-In Surveillance Data**:
+4. **Synthetic Clinical Safety Evaluation Dataset (Batch C)**:
+   * 44 synthetic evaluation scenarios across 14 safety domains stored in `tests/evaluation/batch_c_eval_dataset.json`.
+   * Verifies brand-generic resolution, dosage-form safety, emergency refusals, and statutory attribution.
+5. **Regional Opt-In Surveillance Data**:
    * Anonymized State/Province region strings stored in `public.profiles.region` powering the regional AMR misuse heatmap without compromising user privacy.
+
+---
+
+## 🧪 Comprehensive Evaluation & Regression Loop
+
+MedSentry includes an end-to-end evaluation and verification infrastructure running against the live Supabase backend and local Edge Function logic:
+
+| Suite | Scope | Cases / Tests | Status |
+| :--- | :--- | :--- | :--- |
+| **Batch A** | Medication Context & Dose History | 5 tests | **PASSED (100%)** |
+| **Batch A2** | UI Layout, Spacing & SafeMarkdown | 5 tests | **PASSED (100%)** |
+| **Batch B** | Indian Formulary & Antibiotic Invariants | 10 tests | **PASSED (100%)** |
+| **Batch C** | Clinical Safety & Evaluation Loop | 44 scenarios across 14 domains | **PASSED (100%)** |
+| **Batch C Gates** | Automated Safety Regression Gates | 7 gate invariants | **PASSED (100%)** |
+| **Batch D3** | Runtime Security, JWT & RLS Isolation | 10 security tests | **PASSED (100%)** |
+| **Batch D4** | Source Attribution & URL Sanitization | 6 UI tests | **PASSED (100%)** |
+| **Live Vision** | Multimodal Image Consultation (Daflon 500mg) | Edge Function & Gemini Vision | **PASSED (100%)** |
+
+Run full regression loop:
+```bash
+python3 scripts/run_batch_c_eval.py --all
+python3 scripts/test_batch_d_ui_sources.py
+```
 
 ---
 

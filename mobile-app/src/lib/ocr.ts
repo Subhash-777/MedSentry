@@ -1,5 +1,5 @@
 import { supabase } from './supabase';
-import MlkitOcr, { MlkitOcrResult, MKLBlock } from 'react-native-mlkit-ocr';
+import MlkitOcr, { MlkitOcrResult } from 'react-native-mlkit-ocr';
 import { invokeAIRouter } from './aiRouterClient';
 
 export interface OcrResult {
@@ -209,19 +209,19 @@ export async function findDrugFromOcrText(ocrLines: string[]): Promise<{ id: str
       if (!rpcErr && rpcData && rpcData.length > 0 && rpcData[0].id) {
         return { id: rpcData[0].id, searchTerms };
       }
-    } catch (_) {
+    } catch {
       // RPC may not exist yet if migration pending approval; proceed seamlessly
     }
 
-    // 2. Direct ILIKE search
+    // 2. Direct ILIKE search on both brand name and generic name
     const orQuery = searchWords.map(w => {
-      if (w.length > 5) return `name.ilike.%${w}%`;
-      return `name.ilike.${w}%`;
+      const term = w.length > 5 ? `%${w}%` : `${w}%`;
+      return `name.ilike.${term},generic_name.ilike.${term}`;
     }).join(',');
 
     const { data, error } = await (supabase
       .from('drugs')
-      .select('id, name')
+      .select('id, name, generic_name')
       .or(orQuery)
       .limit(5) as any);
 
@@ -237,13 +237,16 @@ export async function findDrugFromOcrText(ocrLines: string[]): Promise<{ id: str
     const prefixQueries = searchWords
       .filter(w => w.length >= 4)
       .slice(0, 8)
-      .map(w => `name.ilike.${w.slice(0, 4)}%`)
+      .flatMap(w => [
+        `name.ilike.${w.slice(0, 4)}%`,
+        `generic_name.ilike.${w.slice(0, 4)}%`,
+      ])
       .join(',');
 
     if (prefixQueries) {
       const { data: candidates } = await (supabase
         .from('drugs')
-        .select('id, name')
+        .select('id, name, generic_name')
         .or(prefixQueries)
         .limit(25) as any);
 
@@ -251,7 +254,11 @@ export async function findDrugFromOcrText(ocrLines: string[]): Promise<{ id: str
         let bestMatch: { id: string; similarity: number } | null = null;
         for (const candidate of candidates) {
           for (const word of searchWords) {
-            const sim = calculateSimilarity(candidate.name, word);
+            const simName = calculateSimilarity(candidate.name || '', word);
+            const simGeneric = candidate.generic_name
+              ? calculateSimilarity(candidate.generic_name, word)
+              : 0;
+            const sim = Math.max(simName, simGeneric);
             if (sim >= 0.70 && (!bestMatch || sim > bestMatch.similarity)) {
               bestMatch = { id: candidate.id, similarity: sim };
             }
