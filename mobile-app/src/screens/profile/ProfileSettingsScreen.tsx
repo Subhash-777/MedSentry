@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -19,10 +19,38 @@ import {
 import Animated, { FadeInDown, FadeInUp, ZoomIn } from 'react-native-reanimated';
 import * as ImagePicker from 'expo-image-picker';
 import { useNavigation } from '@react-navigation/native';
-import { MapPin, X, Check, ChevronRight, ShieldCheck, Sliders, ArrowRight } from 'lucide-react-native';
+import {
+  MapPin,
+  X,
+  Check,
+  ChevronRight,
+  ShieldCheck,
+  Clock,
+  Bell,
+  Sun,
+  Moon,
+  AlertCircle,
+  CheckCircle2,
+} from 'lucide-react-native';
 import { useAuth } from '../../context/AuthContext';
 import { supabase } from '../../lib/supabase';
 import * as T from '../../theme/colors';
+import {
+  DoseScheduleConfig,
+  DEFAULT_DOSE_SCHEDULE,
+  PRESET_SCHEDULES,
+  getSavedDoseSchedule,
+  saveDoseSchedule,
+  validateDoseSchedule,
+  formatTime12,
+  formatIntervalMinutes,
+  ScheduleValidationResult,
+} from '../../lib/notificationSchedule';
+import {
+  sendImmediateTestReminder,
+  rescheduleAllActiveCoursesReminders,
+  requestNotificationPermissions,
+} from '../../lib/notifications';
 import {
   CapsuleIcon,
   StethoscopeIcon,
@@ -36,7 +64,6 @@ import {
   ScaleWeightIcon,
   RulerHeightIcon,
   EditPencilIcon,
-  LockIcon,
   PhoneCallIcon,
   LogoutIcon,
   SettingsGearIcon,
@@ -79,6 +106,131 @@ export default function ProfileSettingsScreen() {
   const [passwordModalVisible, setPasswordModalVisible] = useState(false);
   const [medicalIdModalVisible, setMedicalIdModalVisible] = useState(false);
   const [langModalVisible, setLangModalVisible] = useState(false);
+
+  // Dose Notification Timing Schedule State
+  const [scheduleModalVisible, setScheduleModalVisible] = useState(false);
+  const [doseSchedule, setDoseSchedule] = useState<DoseScheduleConfig>(DEFAULT_DOSE_SCHEDULE);
+  const [tempSchedule, setTempSchedule] = useState<DoseScheduleConfig>(DEFAULT_DOSE_SCHEDULE);
+  const [selectedPresetId, setSelectedPresetId] = useState<string | null>('standard');
+  const [savingSchedule, setSavingSchedule] = useState(false);
+  const [testSending, setTestSending] = useState(false);
+  const [scheduleToast, setScheduleToast] = useState<string | null>(null);
+
+  // Validation derived on current working schedule
+  const validationResult: ScheduleValidationResult = validateDoseSchedule(tempSchedule);
+
+  // Load saved schedule on mount
+  useEffect(() => {
+    let isMounted = true;
+    (async () => {
+      try {
+        const saved = await getSavedDoseSchedule();
+        if (isMounted && saved) {
+          setDoseSchedule(saved);
+          setTempSchedule(saved);
+        }
+      } catch (err) {
+        console.warn('Failed to load initial dose schedule', err);
+      }
+    })();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const openScheduleModal = () => {
+    setTempSchedule({ ...doseSchedule });
+    setScheduleToast(null);
+    setScheduleModalVisible(true);
+  };
+
+  const handleApplyPreset = (presetId: string) => {
+    const preset = PRESET_SCHEDULES.find((p) => p.id === presetId);
+    if (preset) {
+      setSelectedPresetId(presetId);
+      setTempSchedule(JSON.parse(JSON.stringify(preset.schedule)));
+    }
+  };
+
+  const adjustSlotTime = (slotKey: 'morning' | 'afternoon' | 'evening' | 'night', deltaMinutes: number) => {
+    setSelectedPresetId(null);
+    setTempSchedule((prev) => {
+      const slot = prev[slotKey];
+      let totalMinutes = slot.hour * 60 + slot.minute + deltaMinutes;
+
+      // Bound between 05:00 (300 min) and 23:45 (1425 min)
+      if (totalMinutes < 300) totalMinutes = 300;
+      if (totalMinutes > 1425) totalMinutes = 1425;
+
+      const newHour = Math.floor(totalMinutes / 60);
+      const newMinute = totalMinutes % 60;
+
+      return {
+        ...prev,
+        [slotKey]: {
+          ...slot,
+          hour: newHour,
+          minute: newMinute,
+        },
+      };
+    });
+  };
+
+  const handleSaveDoseSchedule = async () => {
+    if (!validationResult.isValid) {
+      Alert.alert(
+        'Interval Constraint Notice',
+        validationResult.errors.morningAfternoon ||
+          validationResult.errors.afternoonEvening ||
+          validationResult.errors.eveningNight ||
+          validationResult.errors.diurnal ||
+          'Please ensure safe clinical spacing between medication reminder times.'
+      );
+      return;
+    }
+
+    setSavingSchedule(true);
+    try {
+      const res = await saveDoseSchedule(tempSchedule);
+      if (!res.success) {
+        Alert.alert('Save Error', res.error || 'Failed to update reminder schedule.');
+        setSavingSchedule(false);
+        return;
+      }
+
+      setDoseSchedule(tempSchedule);
+      // Reschedule active medications in background
+      await rescheduleAllActiveCoursesReminders();
+
+      setScheduleToast('Reminder schedule updated with active interval constraints!');
+      setTimeout(() => {
+        setScheduleModalVisible(false);
+        setScheduleToast(null);
+      }, 1000);
+    } catch (err: any) {
+      Alert.alert('Error', err.message || 'Could not save dose reminder schedule.');
+    } finally {
+      setSavingSchedule(false);
+    }
+  };
+
+  const handleTestNotification = async (slotLabel: string, hour: number, minute: number) => {
+    setTestSending(true);
+    try {
+      const permitted = await requestNotificationPermissions();
+      if (!permitted) {
+        Alert.alert('Notifications Disabled', 'Please enable notifications in device settings to receive dose reminders.');
+        setTestSending(false);
+        return;
+      }
+      await sendImmediateTestReminder(slotLabel, formatTime12(hour, minute));
+      Alert.alert('Test Notification Sent 💊', `MedSentry reminder for ${slotLabel} (${formatTime12(hour, minute)}) triggered on your device.`);
+    } catch (err: any) {
+      Alert.alert('Test Failed', err.message || 'Could not trigger test reminder.');
+    } finally {
+      setTestSending(false);
+    }
+  };
 
   // Profile Edit Form State
   const [fullNameInput, setFullNameInput] = useState('');
@@ -637,6 +789,27 @@ export default function ProfileSettingsScreen() {
           </View>
         </TouchableOpacity>
 
+        {/* Dose Reminder Schedule Item */}
+        <TouchableOpacity style={styles.rowItem} onPress={openScheduleModal} activeOpacity={0.7}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, flex: 1 }}>
+            <View style={styles.timingIconBadge}>
+              <Bell color={T.sageGreenSolid} size={15} />
+            </View>
+            <View style={{ flex: 1, paddingRight: 6 }}>
+              <Text style={styles.rowLabel}>Dose Reminder Schedule</Text>
+              <Text style={styles.schedulePreviewText} numberOfLines={1}>
+                {formatTime12(doseSchedule.morning.hour, doseSchedule.morning.minute)} · {formatTime12(doseSchedule.afternoon.hour, doseSchedule.afternoon.minute)} · {formatTime12(doseSchedule.evening.hour, doseSchedule.evening.minute)}
+              </Text>
+            </View>
+          </View>
+          <View style={styles.rowValueWrap}>
+            <View style={styles.customPill}>
+              <Text style={styles.customPillText}>Custom</Text>
+            </View>
+            <Text style={styles.rowArrow}>›</Text>
+          </View>
+        </TouchableOpacity>
+
         {/* Region Item */}
         <TouchableOpacity style={styles.rowItem} onPress={openEditModal} activeOpacity={0.7}>
           <Text style={styles.rowLabel}>Surveillance Region</Text>
@@ -1124,6 +1297,378 @@ export default function ProfileSettingsScreen() {
             </TouchableOpacity>
           </Animated.View>
         </View>
+      </Modal>
+
+      {/* ── DOSE NOTIFICATION TIMING CUSTOMIZER MODAL ───────────────────────── */}
+      <Modal visible={scheduleModalVisible} animationType="slide" transparent>
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={{ flex: 1 }}>
+          <View style={styles.modalOverlay}>
+            <Animated.View entering={FadeInUp.duration(350)} style={[styles.modalSheet, { maxHeight: '92%' }]}>
+              <View style={styles.sheetHandle} />
+
+              <View style={styles.modalHeader}>
+                <View style={{ flex: 1, paddingRight: 8 }}>
+                  <Text style={styles.modalTitle}>Dose Reminder Schedule</Text>
+                  <Text style={styles.modalSubtitle}>
+                    Customize alert times for morning, afternoon &amp; evening doses
+                  </Text>
+                </View>
+                <TouchableOpacity onPress={() => setScheduleModalVisible(false)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                  <X color={T.textColor} size={20} />
+                </TouchableOpacity>
+              </View>
+
+              <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 24 }}>
+                {/* Clinical Interval Constraint Callout */}
+                <View style={styles.clinicalInfoCard}>
+                  <View style={styles.clinicalInfoIconWrap}>
+                    <ShieldCheck color={T.sageGreenSolid} size={18} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.clinicalInfoTitle}>Clinical Interval Constraints Active</Text>
+                    <Text style={styles.clinicalInfoDesc}>
+                      To prevent high peak concentration and allow adequate drug absorption, reminders enforce safe spacing: minimum 3h between morning/afternoon and afternoon/evening, and 2.5h before bedtime.
+                    </Text>
+                  </View>
+                </View>
+
+                {/* Rhythm Presets */}
+                <Text style={styles.scheduleSectionHeading}>RECOMMENDED RHYTHMS</Text>
+                <View style={styles.presetButtonsRow}>
+                  {PRESET_SCHEDULES.map((p) => {
+                    const isSelected = selectedPresetId === p.id;
+                    return (
+                      <TouchableOpacity
+                        key={p.id}
+                        style={[styles.presetCardBtn, isSelected && styles.presetCardBtnSelected]}
+                        onPress={() => handleApplyPreset(p.id)}
+                        activeOpacity={0.8}
+                      >
+                        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 2 }}>
+                          <Text style={[styles.presetCardTitle, isSelected && styles.presetCardTitleSelected]}>
+                            {p.name}
+                          </Text>
+                          {isSelected && <Check size={13} color={T.sageGreenSolid} />}
+                        </View>
+                        <Text style={[styles.presetCardDesc, isSelected && styles.presetCardDescSelected]} numberOfLines={2}>
+                          {p.description}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+
+                {/* Slots Customizer */}
+                <Text style={[styles.scheduleSectionHeading, { marginTop: 18 }]}>CUSTOMIZE DOSE INTERVALS</Text>
+
+                {/* 1. MORNING SLOT */}
+                <View style={styles.doseSlotCard}>
+                  <View style={styles.slotCardHeader}>
+                    <View style={styles.slotIconBadgeMorning}>
+                      <Sun size={17} color="#D97706" />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.slotTitle}>{tempSchedule.morning.label}</Text>
+                      <Text style={styles.slotSubtitle}>{tempSchedule.morning.subtitle}</Text>
+                    </View>
+                    <View style={styles.timeDisplayPill}>
+                      <Clock size={12} color={T.sageGreenSolid} style={{ marginRight: 4 }} />
+                      <Text style={styles.timeDisplayText}>
+                        {formatTime12(tempSchedule.morning.hour, tempSchedule.morning.minute)}
+                      </Text>
+                    </View>
+                  </View>
+                  <View style={styles.stepperRow}>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => adjustSlotTime('morning', -30)}>
+                      <Text style={styles.stepperBtnText}>-30m</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => adjustSlotTime('morning', -15)}>
+                      <Text style={styles.stepperBtnText}>-15m</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => adjustSlotTime('morning', 15)}>
+                      <Text style={styles.stepperBtnText}>+15m</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => adjustSlotTime('morning', 30)}>
+                      <Text style={styles.stepperBtnText}>+30m</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.testAlertSlotBtn}
+                      onPress={() => handleTestNotification('Morning Dose', tempSchedule.morning.hour, tempSchedule.morning.minute)}
+                      disabled={testSending}
+                    >
+                      <Bell size={12} color={T.sageGreenSolid} />
+                      <Text style={styles.testAlertSlotBtnText}>Test</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+
+                {/* Connector: Morning -> Afternoon */}
+                <View style={styles.intervalConnector}>
+                  <View
+                    style={[
+                      styles.intervalBadge,
+                      validationResult.intervals.morningToAfternoonMinutes < 180
+                        ? styles.intervalBadgeWarning
+                        : styles.intervalBadgeSuccess,
+                    ]}
+                  >
+                    {validationResult.intervals.morningToAfternoonMinutes < 180 ? (
+                      <AlertCircle size={13} color={T.dangerClaySolid} />
+                    ) : (
+                      <CheckCircle2 size={13} color={T.sageGreenSolid} />
+                    )}
+                    <Text
+                      style={[
+                        styles.intervalBadgeText,
+                        validationResult.intervals.morningToAfternoonMinutes < 180
+                          ? styles.intervalBadgeTextWarning
+                          : styles.intervalBadgeTextSuccess,
+                      ]}
+                    >
+                      {formatIntervalMinutes(validationResult.intervals.morningToAfternoonMinutes)} spacing{' '}
+                      {validationResult.intervals.morningToAfternoonMinutes < 180 ? '(Min 3h required!)' : '(Safe spacing)'}
+                    </Text>
+                  </View>
+                </View>
+
+                {/* 2. AFTERNOON SLOT */}
+                <View style={styles.doseSlotCard}>
+                  <View style={styles.slotCardHeader}>
+                    <View style={styles.slotIconBadgeAfternoon}>
+                      <Sun size={17} color="#EA580C" />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.slotTitle}>{tempSchedule.afternoon.label}</Text>
+                      <Text style={styles.slotSubtitle}>{tempSchedule.afternoon.subtitle}</Text>
+                    </View>
+                    <View style={styles.timeDisplayPill}>
+                      <Clock size={12} color={T.sageGreenSolid} style={{ marginRight: 4 }} />
+                      <Text style={styles.timeDisplayText}>
+                        {formatTime12(tempSchedule.afternoon.hour, tempSchedule.afternoon.minute)}
+                      </Text>
+                    </View>
+                  </View>
+                  <View style={styles.stepperRow}>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => adjustSlotTime('afternoon', -30)}>
+                      <Text style={styles.stepperBtnText}>-30m</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => adjustSlotTime('afternoon', -15)}>
+                      <Text style={styles.stepperBtnText}>-15m</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => adjustSlotTime('afternoon', 15)}>
+                      <Text style={styles.stepperBtnText}>+15m</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => adjustSlotTime('afternoon', 30)}>
+                      <Text style={styles.stepperBtnText}>+30m</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.testAlertSlotBtn}
+                      onPress={() => handleTestNotification('Afternoon Dose', tempSchedule.afternoon.hour, tempSchedule.afternoon.minute)}
+                      disabled={testSending}
+                    >
+                      <Bell size={12} color={T.sageGreenSolid} />
+                      <Text style={styles.testAlertSlotBtnText}>Test</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+
+                {/* Connector: Afternoon -> Evening */}
+                <View style={styles.intervalConnector}>
+                  <View
+                    style={[
+                      styles.intervalBadge,
+                      validationResult.intervals.afternoonToEveningMinutes < 180
+                        ? styles.intervalBadgeWarning
+                        : styles.intervalBadgeSuccess,
+                    ]}
+                  >
+                    {validationResult.intervals.afternoonToEveningMinutes < 180 ? (
+                      <AlertCircle size={13} color={T.dangerClaySolid} />
+                    ) : (
+                      <CheckCircle2 size={13} color={T.sageGreenSolid} />
+                    )}
+                    <Text
+                      style={[
+                        styles.intervalBadgeText,
+                        validationResult.intervals.afternoonToEveningMinutes < 180
+                          ? styles.intervalBadgeTextWarning
+                          : styles.intervalBadgeTextSuccess,
+                      ]}
+                    >
+                      {formatIntervalMinutes(validationResult.intervals.afternoonToEveningMinutes)} spacing{' '}
+                      {validationResult.intervals.afternoonToEveningMinutes < 180 ? '(Min 3h required!)' : '(Safe spacing)'}
+                    </Text>
+                  </View>
+                </View>
+
+                {/* 3. EVENING SLOT */}
+                <View style={styles.doseSlotCard}>
+                  <View style={styles.slotCardHeader}>
+                    <View style={styles.slotIconBadgeEvening}>
+                      <Moon size={17} color="#4F46E5" />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.slotTitle}>{tempSchedule.evening.label}</Text>
+                      <Text style={styles.slotSubtitle}>{tempSchedule.evening.subtitle}</Text>
+                    </View>
+                    <View style={styles.timeDisplayPill}>
+                      <Clock size={12} color={T.sageGreenSolid} style={{ marginRight: 4 }} />
+                      <Text style={styles.timeDisplayText}>
+                        {formatTime12(tempSchedule.evening.hour, tempSchedule.evening.minute)}
+                      </Text>
+                    </View>
+                  </View>
+                  <View style={styles.stepperRow}>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => adjustSlotTime('evening', -30)}>
+                      <Text style={styles.stepperBtnText}>-30m</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => adjustSlotTime('evening', -15)}>
+                      <Text style={styles.stepperBtnText}>-15m</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => adjustSlotTime('evening', 15)}>
+                      <Text style={styles.stepperBtnText}>+15m</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => adjustSlotTime('evening', 30)}>
+                      <Text style={styles.stepperBtnText}>+30m</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.testAlertSlotBtn}
+                      onPress={() => handleTestNotification('Evening Dose', tempSchedule.evening.hour, tempSchedule.evening.minute)}
+                      disabled={testSending}
+                    >
+                      <Bell size={12} color={T.sageGreenSolid} />
+                      <Text style={styles.testAlertSlotBtnText}>Test</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+
+                {/* Connector: Evening -> Bedtime */}
+                <View style={styles.intervalConnector}>
+                  <View
+                    style={[
+                      styles.intervalBadge,
+                      validationResult.intervals.eveningToNightMinutes < 150
+                        ? styles.intervalBadgeWarning
+                        : styles.intervalBadgeSuccess,
+                    ]}
+                  >
+                    {validationResult.intervals.eveningToNightMinutes < 150 ? (
+                      <AlertCircle size={13} color={T.dangerClaySolid} />
+                    ) : (
+                      <CheckCircle2 size={13} color={T.sageGreenSolid} />
+                    )}
+                    <Text
+                      style={[
+                        styles.intervalBadgeText,
+                        validationResult.intervals.eveningToNightMinutes < 150
+                          ? styles.intervalBadgeTextWarning
+                          : styles.intervalBadgeTextSuccess,
+                      ]}
+                    >
+                      {formatIntervalMinutes(validationResult.intervals.eveningToNightMinutes)} spacing{' '}
+                      {validationResult.intervals.eveningToNightMinutes < 150 ? '(Min 2.5h required!)' : '(Safe spacing)'}
+                    </Text>
+                  </View>
+                </View>
+
+                {/* 4. BEDTIME SLOT */}
+                <View style={styles.doseSlotCard}>
+                  <View style={styles.slotCardHeader}>
+                    <View style={styles.slotIconBadgeNight}>
+                      <Moon size={17} color="#0F172A" />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.slotTitle}>{tempSchedule.night.label}</Text>
+                      <Text style={styles.slotSubtitle}>{tempSchedule.night.subtitle}</Text>
+                    </View>
+                    <View style={styles.timeDisplayPill}>
+                      <Clock size={12} color={T.sageGreenSolid} style={{ marginRight: 4 }} />
+                      <Text style={styles.timeDisplayText}>
+                        {formatTime12(tempSchedule.night.hour, tempSchedule.night.minute)}
+                      </Text>
+                    </View>
+                  </View>
+                  <View style={styles.stepperRow}>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => adjustSlotTime('night', -30)}>
+                      <Text style={styles.stepperBtnText}>-30m</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => adjustSlotTime('night', -15)}>
+                      <Text style={styles.stepperBtnText}>-15m</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => adjustSlotTime('night', 15)}>
+                      <Text style={styles.stepperBtnText}>+15m</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => adjustSlotTime('night', 30)}>
+                      <Text style={styles.stepperBtnText}>+30m</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.testAlertSlotBtn}
+                      onPress={() => handleTestNotification('Bedtime Dose', tempSchedule.night.hour, tempSchedule.night.minute)}
+                      disabled={testSending}
+                    >
+                      <Bell size={12} color={T.sageGreenSolid} />
+                      <Text style={styles.testAlertSlotBtnText}>Test</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+
+                {/* Constraint Error Banner */}
+                {!validationResult.isValid && (
+                  <View style={styles.constraintErrorCard}>
+                    <AlertCircle size={20} color={T.dangerClaySolid} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.constraintErrorTitle}>Interval Constraint Violation</Text>
+                      <Text style={styles.constraintErrorDesc}>
+                        {validationResult.errors.morningAfternoon ||
+                          validationResult.errors.afternoonEvening ||
+                          validationResult.errors.eveningNight ||
+                          validationResult.errors.diurnal}
+                      </Text>
+                    </View>
+                  </View>
+                )}
+
+                {/* Toast Feedback */}
+                {scheduleToast && (
+                  <View style={styles.scheduleSuccessCard}>
+                    <CheckCircle2 size={18} color={T.sageGreenSolid} />
+                    <Text style={styles.scheduleSuccessText}>{scheduleToast}</Text>
+                  </View>
+                )}
+
+                {/* Action Buttons */}
+                <View style={{ marginTop: 20, gap: 10 }}>
+                  <TouchableOpacity
+                    style={[
+                      styles.saveScheduleBtn,
+                      (!validationResult.isValid || savingSchedule) && styles.saveScheduleBtnDisabled,
+                    ]}
+                    onPress={handleSaveDoseSchedule}
+                    disabled={!validationResult.isValid || savingSchedule}
+                    activeOpacity={0.85}
+                  >
+                    {savingSchedule ? (
+                      <ActivityIndicator size="small" color="#FFFFFF" />
+                    ) : (
+                      <>
+                        <Check size={18} color="#FFFFFF" />
+                        <Text style={styles.saveScheduleBtnText}>Save Notification Schedule</Text>
+                      </>
+                    )}
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={styles.cancelBtn}
+                    onPress={() => setScheduleModalVisible(false)}
+                    disabled={savingSchedule}
+                  >
+                    <Text style={styles.cancelBtnText}>Dismiss</Text>
+                  </TouchableOpacity>
+                </View>
+              </ScrollView>
+            </Animated.View>
+          </View>
+        </KeyboardAvoidingView>
       </Modal>
     </ScrollView>
   );
@@ -1823,4 +2368,318 @@ const styles = StyleSheet.create({
 
   cancelBtn: { alignItems: 'center', paddingVertical: 12 },
   cancelBtnText: { color: T.caption, fontWeight: '700', fontSize: T.fontSize.body },
+
+  // Dose Notification Timing Customizer Styles
+  timingIconBadge: {
+    width: 28,
+    height: 28,
+    borderRadius: 8,
+    backgroundColor: T.sageGreen + '20',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  schedulePreviewText: {
+    fontSize: 12,
+    color: T.caption,
+    fontWeight: '500',
+    marginTop: 2,
+  },
+  customPill: {
+    backgroundColor: T.paleJade + '33',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: T.radius.pill,
+    borderWidth: 1,
+    borderColor: T.sageGreen + '44',
+  },
+  customPillText: {
+    fontSize: 11,
+    color: T.sageGreenSolid,
+    fontWeight: '700',
+  },
+  modalSubtitle: {
+    fontSize: 12,
+    color: T.caption,
+    fontWeight: '500',
+    marginTop: 2,
+  },
+  clinicalInfoCard: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+    backgroundColor: T.surfaceCard,
+    padding: 12,
+    borderRadius: T.radius.card,
+    borderWidth: 1,
+    borderColor: T.sageGreen + '44',
+    marginBottom: 14,
+  },
+  clinicalInfoIconWrap: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: T.sageGreen + '22',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 2,
+  },
+  clinicalInfoTitle: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: T.sageGreenSolid,
+    marginBottom: 2,
+  },
+  clinicalInfoDesc: {
+    fontSize: 11,
+    color: T.caption,
+    lineHeight: 16,
+    fontWeight: '500',
+  },
+  scheduleSectionHeading: {
+    fontSize: 11,
+    letterSpacing: 0.8,
+    color: T.caption,
+    fontWeight: '800',
+    marginBottom: 8,
+  },
+  presetButtonsRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  presetCardBtn: {
+    flex: 1,
+    backgroundColor: T.background,
+    padding: 10,
+    borderRadius: T.radius.card,
+    borderWidth: 1,
+    borderColor: T.border,
+  },
+  presetCardBtnSelected: {
+    borderColor: T.sageGreenSolid,
+    backgroundColor: T.paleJade + '25',
+  },
+  presetCardTitle: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: T.textColor,
+  },
+  presetCardTitleSelected: {
+    color: T.sageGreenSolid,
+  },
+  presetCardDesc: {
+    fontSize: 10,
+    color: T.caption,
+    lineHeight: 13,
+    fontWeight: '500',
+  },
+  presetCardDescSelected: {
+    color: T.textColor,
+  },
+  doseSlotCard: {
+    backgroundColor: T.surfaceElevated,
+    borderRadius: T.radius.card,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: T.border,
+    shadowColor: '#000',
+    shadowOpacity: 0.03,
+    shadowOffset: { width: 0, height: 2 },
+    shadowRadius: 4,
+    elevation: 1,
+  },
+  slotCardHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 10,
+  },
+  slotIconBadgeMorning: {
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    backgroundColor: '#FEF3C7',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  slotIconBadgeAfternoon: {
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    backgroundColor: '#FFEDD5',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  slotIconBadgeEvening: {
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    backgroundColor: '#E0E7FF',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  slotIconBadgeNight: {
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    backgroundColor: '#F1F5F9',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  slotTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: T.textColor,
+  },
+  slotSubtitle: {
+    fontSize: 11,
+    color: T.caption,
+    fontWeight: '500',
+  },
+  timeDisplayPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: T.background,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: T.radius.pill,
+    borderWidth: 1,
+    borderColor: T.border,
+  },
+  timeDisplayText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: T.textColor,
+  },
+  stepperRow: {
+    flexDirection: 'row',
+    gap: 6,
+    alignItems: 'center',
+  },
+  stepperBtn: {
+    flex: 1,
+    paddingVertical: 7,
+    backgroundColor: T.background,
+    borderRadius: T.radius.small,
+    borderWidth: 1,
+    borderColor: T.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  stepperBtnText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: T.textColor,
+  },
+  testAlertSlotBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    backgroundColor: T.sageGreen + '20',
+    borderRadius: T.radius.small,
+    borderWidth: 1,
+    borderColor: T.sageGreen + '55',
+  },
+  testAlertSlotBtnText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: T.sageGreenSolid,
+  },
+  intervalConnector: {
+    alignItems: 'center',
+    paddingVertical: 6,
+  },
+  intervalBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: T.radius.pill,
+    borderWidth: 1,
+  },
+  intervalBadgeSuccess: {
+    backgroundColor: T.paleJade + '25',
+    borderColor: T.sageGreen + '55',
+  },
+  intervalBadgeWarning: {
+    backgroundColor: T.dangerClay + '20',
+    borderColor: T.dangerClay + '66',
+  },
+  intervalBadgeText: {
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  intervalBadgeTextSuccess: {
+    color: T.sageGreenSolid,
+  },
+  intervalBadgeTextWarning: {
+    color: T.dangerClaySolid,
+    fontWeight: '700',
+  },
+  constraintErrorCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: T.dangerClay + '18',
+    padding: 12,
+    borderRadius: T.radius.card,
+    borderWidth: 1,
+    borderColor: T.dangerClay + '55',
+    marginTop: 14,
+  },
+  constraintErrorTitle: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: T.dangerClaySolid,
+  },
+  constraintErrorDesc: {
+    fontSize: 11,
+    color: T.textColor,
+    marginTop: 1,
+    fontWeight: '500',
+  },
+  scheduleSuccessCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: T.paleJade + '30',
+    padding: 12,
+    borderRadius: T.radius.card,
+    borderWidth: 1,
+    borderColor: T.sageGreenSolid,
+    marginTop: 12,
+  },
+  scheduleSuccessText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: T.sageGreenSolid,
+    flex: 1,
+  },
+  saveScheduleBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: T.sageGreenSolid,
+    paddingVertical: 14,
+    borderRadius: T.radius.card,
+    shadowColor: T.sageGreenSolid,
+    shadowOpacity: 0.25,
+    shadowOffset: { width: 0, height: 3 },
+    shadowRadius: 6,
+    elevation: 3,
+  },
+  saveScheduleBtnDisabled: {
+    opacity: 0.5,
+    backgroundColor: T.disabled,
+    shadowOpacity: 0,
+    elevation: 0,
+  },
+  saveScheduleBtnText: {
+    color: '#FFFFFF',
+    fontWeight: '800',
+    fontSize: T.fontSize.body,
+  },
 });

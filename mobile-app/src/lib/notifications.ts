@@ -1,5 +1,7 @@
 import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
+import { getSavedDoseSchedule } from './notificationSchedule';
+import { supabase } from './supabase';
 
 // Configure how notifications behave when the app is in the foreground
 Notifications.setNotificationHandler({
@@ -60,38 +62,42 @@ export async function requestNotificationPermissions() {
 }
 
 export async function scheduleDailyDoseReminder(courseId: string, drugName: string, frequency: string[]) {
-  // Derive times based on structured frequency
-  const scheduleTimes: { hour: number, minute: number }[] = [];
-  
-  // If frequency array is empty, default to 9 AM
+  // Retrieve user's customized dose schedule timings
+  const userSchedule = await getSavedDoseSchedule();
+  const scheduleTimes: { hour: number; minute: number }[] = [];
+
+  // If frequency array is empty, default to morning dose time
   if (!frequency || frequency.length === 0) {
-    scheduleTimes.push({ hour: 9, minute: 0 });
+    scheduleTimes.push({ hour: userSchedule.morning.hour, minute: userSchedule.morning.minute });
   } else {
-    frequency.forEach(freq => {
+    frequency.forEach((freq) => {
       const lower = freq.toLowerCase();
-      if (lower.includes('morning')) scheduleTimes.push({ hour: 8, minute: 0 }); // 8 AM
-      else if (lower.includes('afternoon')) scheduleTimes.push({ hour: 14, minute: 0 }); // 2 PM
-      else if (lower.includes('evening')) scheduleTimes.push({ hour: 18, minute: 0 }); // 6 PM
-      else if (lower.includes('night') || lower.includes('bed')) scheduleTimes.push({ hour: 20, minute: 0 }); // 8 PM
-      else {
-        // Fallback for unknown text, just schedule at 9 AM to be safe
-        scheduleTimes.push({ hour: 9, minute: 0 });
+      if (lower.includes('morning')) {
+        scheduleTimes.push({ hour: userSchedule.morning.hour, minute: userSchedule.morning.minute });
+      } else if (lower.includes('afternoon')) {
+        scheduleTimes.push({ hour: userSchedule.afternoon.hour, minute: userSchedule.afternoon.minute });
+      } else if (lower.includes('evening')) {
+        scheduleTimes.push({ hour: userSchedule.evening.hour, minute: userSchedule.evening.minute });
+      } else if (lower.includes('night') || lower.includes('bed')) {
+        scheduleTimes.push({ hour: userSchedule.night.hour, minute: userSchedule.night.minute });
+      } else {
+        // Fallback for generic frequencies (e.g. daily), schedule at morning dose time
+        scheduleTimes.push({ hour: userSchedule.morning.hour, minute: userSchedule.morning.minute });
       }
     });
   }
 
   // Deduplicate schedule times
-  const uniqueTimes = Array.from(new Set(scheduleTimes.map(t => `${t.hour}:${t.minute}`)))
-    .map(str => {
-      const [h, m] = str.split(':');
-      return { hour: parseInt(h, 10), minute: parseInt(m, 10) };
-    });
+  const uniqueTimes = Array.from(new Set(scheduleTimes.map((t) => `${t.hour}:${t.minute}`))).map((str) => {
+    const [h, m] = str.split(':');
+    return { hour: parseInt(h, 10), minute: parseInt(m, 10) };
+  });
 
   for (const time of uniqueTimes) {
     await Notifications.scheduleNotificationAsync({
       content: {
         title: 'Time for your medication 💊',
-        body: `Remember to take your dose of ${drugName}.`,
+        body: `Remember to take your scheduled dose of ${drugName}.`,
         sound: true,
         categoryIdentifier: 'DOSE_ACTION', // for interactive buttons
         data: { courseId }, // Pass context to the background action
@@ -102,6 +108,55 @@ export async function scheduleDailyDoseReminder(courseId: string, drugName: stri
         minute: time.minute,
       } as Notifications.DailyTriggerInput,
     });
+  }
+}
+
+/**
+ * Fires an immediate test dose reminder notification on the user's device
+ */
+export async function sendImmediateTestReminder(slotLabel: string, timeStr: string) {
+  await setupNotificationCategories();
+  await Notifications.scheduleNotificationAsync({
+    content: {
+      title: `MedSentry Reminder (${slotLabel}) 💊`,
+      body: `Test reminder scheduled for ${timeStr}. Clinical intervals active.`,
+      sound: true,
+      categoryIdentifier: 'DOSE_ACTION',
+      data: { isTest: true },
+    },
+    trigger: null, // trigger immediately
+  });
+}
+
+/**
+ * Re-schedules all active medication courses when the user updates reminder timing
+ */
+export async function rescheduleAllActiveCoursesReminders() {
+  try {
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) return;
+
+    // Fetch active courses
+    const { data: courses } = await supabase
+      .from('medication_courses')
+      .select('id, custom_name, frequency, drug:drugs(name)')
+      .eq('user_id', user.id)
+      .eq('status', 'active');
+
+    if (!courses || courses.length === 0) return;
+
+    // Cancel existing scheduled notifications
+    await Notifications.cancelAllScheduledNotificationsAsync();
+
+    // Re-schedule each course with updated times
+    for (const c of courses as any[]) {
+      const drugName = c.drug?.name || c.custom_name || 'Medication';
+      await scheduleDailyDoseReminder(c.id, drugName, c.frequency || ['morning']);
+    }
+  } catch (err) {
+    console.warn('Failed to reschedule courses after schedule update', err);
   }
 }
 
